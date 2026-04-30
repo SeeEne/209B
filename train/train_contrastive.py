@@ -179,8 +179,13 @@ def main():
     parser.add_argument("--max_steps", type=int, default=-1)
 
     # Data
-    parser.add_argument("--max_hist", type=int, default=256)
-    parser.add_argument("--max_total_len", type=int, default=2048)
+    parser.add_argument("--max_hist", type=int, default=512,
+                        help="History items per example. OneRec's release is "
+                             "already capped at 512, so 512 = full history "
+                             "(matches the eval-time prompt distribution).")
+    parser.add_argument("--max_total_len", type=int, default=3072,
+                        help="Token-length safety cap. ~2600 tokens needed "
+                             "for max_hist=512; leave headroom.")
     parser.add_argument("--num_workers", type=int, default=0)
 
     # LoRA
@@ -359,6 +364,7 @@ def main():
         # while building the merged checkpoint.
         del trainer, model
         import gc
+
         gc.collect()
         torch.cuda.empty_cache()
 

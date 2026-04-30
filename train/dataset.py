@@ -57,12 +57,17 @@ class ContrastiveDataset(Dataset):
     Args:
         parquet_path:   path to train.parquet or valid.parquet
         tokenizer:      a OneRec tokenizer with chat_template already set
-        max_hist:       optional cap on history length (in items, not tokens)
-        max_total_len:  optional cap on total token length per sequence
+        max_hist:       optional cap on history length (in items). OneRec
+                        already truncates at 512, so the default 512 is a
+                        no-op for clean rows. Use a smaller value only for
+                        memory-constrained CPU smoke tests.
+        max_total_len:  safety cap on total token length per sequence.
+                        512 items × 5 tokens + chat template + 3 SID tokens
+                        ≈ 2600 tokens; 3072 leaves headroom.
     """
 
-    def __init__(self, parquet_path, tokenizer, max_hist: Optional[int] = 256,
-                 max_total_len: Optional[int] = 2048):
+    def __init__(self, parquet_path, tokenizer, max_hist: Optional[int] = 512,
+                 max_total_len: Optional[int] = 3072):
         self.df = pd.read_parquet(parquet_path).reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_hist = max_hist

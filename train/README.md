@@ -76,7 +76,7 @@ python train/train_contrastive.py \
     --lr 2e-4 \
     --temperature 0.1 \
     --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 \
-    --max_hist 256 --max_total_len 2048 \
+    --max_hist 512 --max_total_len 3072 \
     --merge_and_save
 ```
 
@@ -120,7 +120,8 @@ model = model.merge_and_unload()
 
 ## Notes
 
-- `max_hist=256` truncates user history to the last 256 items (≈1280 SID tokens). Set higher only if memory allows; the official benchmark uses up to 512.
+- `max_hist=512` keeps the full user history (OneRec's release is already capped at 512). This matches the eval-time prompt distribution exactly. Lower it only if you're OOM — but mind that training and eval will then see different context lengths.
+- `max_total_len=3072`: 512 history items × 5 tokens + chat template + 3 SID tokens ≈ 2600, with ~470 token headroom.
 - The 3 SID tokens scored are `<s_a_X><s_b_Y><s_c_Z>` — `<|sid_end|>` is omitted (deterministic).
 - Each example expands to 2 sequences (chosen + rejected) inside the model forward, so a `--per_device_batch_size 2` micro-batch processes 4 sequences at once.
 - LoRA LR (~2e-4) is intentionally higher than full-FT LR (~1e-5) — LoRA adapters need a stronger update to move from zero init.

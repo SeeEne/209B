@@ -477,8 +477,11 @@ def main():
     parser.add_argument("--train_parquet", default=None,
                         help="If omitted, auto-finds data/contrastive_dataset_v0/train.parquet")
     parser.add_argument("--max_hist", type=int, default=8,
-                        help="History items per example (small for CPU speed)")
-    parser.add_argument("--max_total_len", type=int, default=256)
+                        help="History items per example. Debug default is "
+                             "tiny for CPU speed; production train_contrastive.py "
+                             "uses the full 512 to match the eval distribution.")
+    parser.add_argument("--max_total_len", type=int, default=256,
+                        help="Debug default; production uses 3072.")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_samples", type=int, default=2,
                         help="How many dataset samples to inspect verbatim")
