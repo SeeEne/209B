@@ -181,7 +181,7 @@ def main():
     # Data
     parser.add_argument("--max_hist", type=int, default=256)
     parser.add_argument("--max_total_len", type=int, default=2048)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=0)
 
     # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
@@ -242,7 +242,7 @@ def main():
         args.model_path,
         trust_remote_code=True,
         torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
+        device_map={"": "cuda:0"},
     )
     if hasattr(model, "config"):
         model.config.use_cache = False  # required with grad checkpointing
@@ -355,12 +355,19 @@ def main():
     # ---- Optionally merge for downstream eval ----
     if args.merge_and_save:
         print("Merging LoRA into base weights ...")
+        # Free the trained model first so we don't hold two copies in memory
+        # while building the merged checkpoint.
+        del trainer, model
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Reload base in the desired dtype, attach adapter, merge.
         base = AutoModelForCausalLM.from_pretrained(
             args.model_path,
             trust_remote_code=True,
             torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
+            device_map={"": "cuda:0"},
         )
         merged = PeftModel.from_pretrained(base, str(adapter_dir))
         merged = merged.merge_and_unload()
