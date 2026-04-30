@@ -1,5 +1,17 @@
 # EDA Findings and Pair-Construction Decision
 
+> **Update (2026-04-30) — Method pivoted from DPO to contrastive learning.**
+> The findings below are still load-bearing (signal sparsity, lift validation,
+> per-user reward gap), but the loss they were collected to support (DPO over
+> 5-item chosen / 5-item rejected sequences) was abandoned. The "Known
+> limitation: cross-item temporal causality is broken" section at the bottom
+> is precisely what motivated the pivot. The current method uses a pairwise
+> contrastive loss on **single items** (`prediction_length=1` in
+> [../build_contrastive_dataset.py](../build_contrastive_dataset.py)),
+> sidestepping the synthetic-sequence problem entirely. See
+> [../notebook/eda_ms2.ipynb](../notebook/eda_ms2.ipynb) §6 for the structural
+> argument and [training_plan.md](training_plan.md) for the resulting pipeline.
+
 EDA on `data/OpenOneRec/onerec_bench_release.parquet` (162,074 rows = full split=0 = entire training pool — `split` field is effectively a no-op in the HF release) completed 2026-04-07.
 
 ## Key empirical facts

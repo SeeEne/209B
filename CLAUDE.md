@@ -4,16 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project (current direction)
 
-CS 1090a course project based on the **OpenOneRec** open-source dataset/framework (Kuaishou, 2025), focusing on **DPO data construction strategy**.
+CS 209B course project based on the **OpenOneRec** open-source dataset/framework (Kuaishou, 2025). The project replaces OneRec's separately-trained Reward Model with **direct user behavior signals** as the supervision source for preference alignment, using **contrastive learning** (not DPO — see "Method pivot" below).
 
-**Core research question** (from [notebook/EDA.md](notebook/EDA.md)):
-> In offline recommendation, can user behavior signals directly replace the Reward Model when constructing DPO preference pairs? How do different signal granularities affect alignment?
+**Core research question:**
+> In offline recommendation, can user behavior signals (longview / like / follow / forward) directly replace the Reward Model when constructing preference pairs for alignment training?
 
-**Why this is novel.** OpenOneRec's IPA module trains a separate Reward Model to score beam-search candidate sessions, because in their **online** setting user behaviors (like / follow / longview) only arrive *after* recommendation. We work **offline** on logged data — every behavior signal is already in the parquet — so we can compute reward directly from behavior and skip the Reward Model entirely. The contribution is a systematic ablation of signal granularity for the rule-based reward.
+**Why this is novel.** OneRec's IPA module trains a separate Reward Model to score beam-search candidates because in their **online** setting user behaviors only arrive *after* recommendation. We work **offline** on logged data — every behavior signal is already in the parquet — so we can construct positive/negative pairs directly from behavior and skip the Reward Model entirely.
 
-**Original 4-arm ablation was dropped** after EDA — see "Current status" below. The project now uses a **single reward formula** (Arm 2: `1.0·longview + 1.5·like + 2.0·follow + 1.5·forward`) with a gap threshold. See [notebook/EDA.md](notebook/EDA.md) §"实验设计调整" for the rationale.
+**Method pivot (DPO → contrastive).** The project originally targeted DPO. After EDA we abandoned DPO for two reasons documented in [notebook/eda_ms2.ipynb](notebook/eda_ms2.ipynb) and [oneRec/eda_findings.md](oneRec/eda_findings.md):
+1. Explicit `not_interested` is too sparse (0.06% item rate; ~515 users with both pos+neg) for DPO.
+2. Our top-m / bottom-m construction yields *synthetic* chosen sequences that never existed in the real log; DPO's likelihood-based loss penalizes this off-policy shift.
 
-Read [notebook/EDA.md](notebook/EDA.md) before touching anything — it is the source of truth for current research design, signal definitions, and reward formulas.
+The current method is a **pairwise contrastive loss** on individual items (not sequences):
+```
+score(item | history) = (1/3) * Σ_t log P(item_token_t | history, item_<t)
+L = -log_softmax([score+/τ, score-/τ])[0]
+```
+This sidesteps the synthetic-sequence problem (items, not sequences) and tolerates implicit negatives (no-signal items, which are abundant).
 
 ## Data
 
@@ -25,76 +32,141 @@ data/OpenOneRec/
 ├── video_ad_pid2sid.parquet          # 15.9M video/ad pid → semantic ID (length-3 tuple)
 ├── product_pid2sid.parquet           # 2.1M product pid → semantic ID
 └── benchmark_data/
-    ├── video/video_test.parquet      # 38,781 rows
+    ├── video/video_test.parquet      # 38,781 rows  (the test set we evaluate on)
     ├── ad/ad_test.parquet            # 27,677 rows
     ├── product/product_test.parquet  # 27,910 rows
     ├── sid2pid.json
     └── sid2iid.json
 ```
 
-Not downloaded (skip unless task expands): `pid2caption.parquet`, and the 5 other benchmark task directories (`interactive`, `label_cond`, `label_pred`, `item_understand`, `rec_reason`).
+Plus a derived training set built from the master table:
 
-**Important schema notes** (from inspecting the parquet):
-- Repo SFT scripts only consume `split=0` rows. All analyses must filter to `split=0` to avoid leaking benchmark users.
-- `hist_video_*` behavior columns are `list<int64>` aligned to `hist_video_pid` (per-item labels, not aggregate counts). Same for `target_video_*`.
-- `hist_ad_pid`, `hist_goods_pid`, `hist_longview_video_list` are `list<double>` (not int) because of NaN padding — cast to int after filtering NaNs.
-- Mapping tables: `sid` is a `list<int64>` of length 3 (verify in EDA).
+```
+data/contrastive_dataset_v0/
+├── train.parquet                      # 125,031 (history, chosen_sid, rejected_sid) triples
+├── valid.parquet                      # 13,892 triples (10% holdout)
+└── meta.json                          # build config + skip counts
+```
 
-## Current status (2026-04-07)
-
-EDA Scripts 1/2/3 completed. Reports in [notebook/outputs/](notebook/outputs/). Key findings drove a research-design adjustment — see [notebook/EDA.md](notebook/EDA.md) §"EDA 跑出来后的关键发现" and §"实验设计调整" for the full record. Highlights:
-
-- **Data is clean**: 162,074 split=0 rows = full training pool, 100% pid→sid coverage, behavior/pid length alignment 0 mismatches, 156,245 usable users.
-- **Behavior signals validated**: explicit-positive signals (like/follow/forward) lift longview rate 1.36-1.88×; not_interested suppresses it to 0.66× — semantic-consistency hypothesis fully supported.
-- **Critical finding**: target-side `not_interested` is extremely sparse (0.06% item rate; 0.34% user coverage). This kills the original Arm 3 design.
-- **Arm 2 vs Arm 3 chosen-subset agreement = 99.83%** — Arm 3 ablation effect ≤ ~500 samples.
-- **Decision**: drop the 4-arm ablation. Use a single Arm 2 reward (`1.0·longview + 1.5·like + 2.0·follow + 1.5·forward`) with `gap > 1.5` filter → **105,383 DPO pairs** (Zephyr-DPO scale). Treat the Arm 3 vs Arm 2 finding as a negative result for the discussion section.
-- **Pair construction**: per user, take the 10-item `target_video_pid`, score per item under Arm 2, top-5 = chosen, bot-5 = rejected, both reordered by original target time. One pair per user.
-- **Base model**: download [`OpenOneRec/OneRec-1.7B`](https://huggingface.co/OpenOneRec/OneRec-1.7B) (4.29 GB, ungated, post-SFT Standard version). Skip Pro variants (internal-data drift) and pretrain-only variants (would need to redo SFT).
-
-**Next steps**:
-1. Write `build_dpo_dataset.py` → `data/dpo_dataset/{train,valid}.parquet` + `meta.json`
-2. Download `OpenOneRec/OneRec-1.7B`
-3. DPO training (trl `DPOTrainer` or repo's RL script) on single A100/A6000
-4. Eval on `benchmark_data/video/video_test.parquet` — Recall@10, Pass@32, Pass@1
+**Important schema notes:**
+- Repo SFT scripts only consume `split=0` rows — but in the HF release every row has `split=0`, so the filter is effectively a no-op.
+- `hist_video_*` / `target_video_*` behavior columns are `list<int64>` aligned 1:1 to `*_pid` (per-item labels, not aggregate counts).
+- `hist_ad_pid`, `hist_goods_pid`, `hist_longview_video_list` are `list<double>` (NaN-padded) — cast to int after filtering.
+- `sid` is a `list<int64>` of length 3.
 
 ## Repo layout
 
 ```
 project/
 ├── CLAUDE.md                              # this file
+├── build_contrastive_dataset.py           # builds contrastive_dataset_v0 from the master table
 ├── notebook/
-│   ├── EDA.md                             # CURRENT research design + EDA spec (source of truth)
-│   ├── EDA_报告.md                         # summary report of all EDA findings (Chinese)
-│   ├── eda_data_health.py                 # Script 1: dataset quality checks
-│   ├── eda_behavior_signals.py            # Script 2: behavior signal analysis
-│   ├── eda_dpo_feasibility.py             # Script 3: DPO pair feasibility
-│   ├── eda_ms2.ipynb                      # milestone 2 notebook
-│   ├── eda_story.ipynb                    # narrative notebook
+│   ├── EDA.md                             # MS2 research-design spec (historical)
+│   ├── EDA_报告.md                         # MS2 findings summary (Chinese)
+│   ├── eda_data_health.py                 # MS2 Script 1
+│   ├── eda_behavior_signals.py            # MS2 Script 2
+│   ├── eda_dpo_feasibility.py             # MS2 Script 3 (DPO feasibility — kept for record)
+│   ├── eda_ms2.ipynb                      # MS2 narrative notebook (DPO → contrastive pivot story)
+│   ├── eda_story.ipynb                    # earlier narrative draft
+│   ├── ms3.ipynb                          # MS3 deliverable: EDA on contrastive set + baseline + pipeline
+│   ├── ms3_baseline.ipynb                 # standalone baseline run on video_test.parquet (GPU)
 │   └── outputs/                           # text reports from EDA scripts
-├── data/OpenOneRec/                       # downloaded dataset (not in git)
-└── oneRec/*.pdf                           # reference papers (OneRec tech report + dataset notes)
+├── train/
+│   ├── README.md                          # how to train + evaluate
+│   ├── dataset.py                         # ContrastiveDataset (builds OneRec-format prompts)
+│   ├── train_contrastive.py               # LoRA contrastive FT via HF Trainer + PEFT
+│   └── evaluate_origin.py                 # official-protocol Recall@K / Pass@K eval
+├── data/                                  # not in git
+│   ├── OpenOneRec/                        # downloaded HF dataset
+│   └── contrastive_dataset_v0/            # built by build_contrastive_dataset.py
+├── test_eda.ipynb                         # teammate's reference baseline (read-only)
+└── oneRec/
+    ├── *.pdf                              # OneRec tech report + dataset notes
+    ├── training_plan.md                   # current training plan (LoRA + contrastive)
+    └── eda_findings.md                    # MS2 EDA findings (history + DPO→contrastive pivot)
 ```
 
-EDA scripts each resolve `DATA_DIR` relative to `PROJECT_ROOT` (parent of `notebook/`), pointing to `data/OpenOneRec/`. EDA.md uses `raw_data/` as a placeholder — ignore that; the scripts already use the correct path.
+## Current status (2026-04-30)
+
+**MS2 (EDA) — DONE.** Reports in [notebook/outputs/](notebook/outputs/), narrative in [notebook/eda_ms2.ipynb](notebook/eda_ms2.ipynb).
+- Data is clean: 162,074 split=0 rows, 100% pid→sid coverage, 0 behavior/pid alignment mismatches, 156,245 usable users.
+- Behavior signals semantically validated: like/follow/forward lift longview rate 1.36–1.88×; not_interested suppresses to 0.66×.
+- Critical finding that triggered the DPO → contrastive pivot: target-side `not_interested` fires on only 0.06% of items.
+
+**Contrastive dataset v0 — DONE.** Built by [build_contrastive_dataset.py](build_contrastive_dataset.py), `prediction_length=1`:
+- Positive item: `longview=1` OR `like=1` OR `follow=1` OR `forward=1`
+- Negative item: `not_interested=1` OR all 5 signals = 0
+- 138,923 pairs total (125,031 train / 13,892 valid), 85.7% user coverage.
+
+**Baseline evaluation — DONE.** OneRec-1.7B (no fine-tuning) on `video_test.parquet[:100]`:
+- Recall@32 = 0.0231, Pass@32 = 0.13, Pass@1 = 0.06
+- Reproduces official Table 4 numbers within sample-size variance — eval pipeline confirmed correct.
+- Code: [notebook/ms3_baseline.ipynb](notebook/ms3_baseline.ipynb), packaged as CLI in [train/evaluate_origin.py](train/evaluate_origin.py).
+
+**Training pipeline — READY (LoRA + HF Trainer + PEFT).** See [train/README.md](train/README.md).
+- `train_contrastive.py` defaults `--model_path` to `OpenOneRec/OneRec-1.7B` (auto-pulled from HF Hub on first run).
+- LoRA targets `q/k/v/o_proj` + `gate/up/down_proj` (Qwen-3 attention + MLP), `r=16`, `alpha=32`.
+- Eval-time metric driving best-checkpoint selection: `pref_acc` on the valid set (fraction where chosen_score > rejected_score).
+- Optionally `--merge_and_save` to write a fully-merged checkpoint that `evaluate_origin.py` can load directly.
+
+**Next steps:**
+1. Run LoRA contrastive FT on a CUDA GPU.
+2. Re-run `evaluate_origin.py` on the trained checkpoint, compare Recall@32 / Pass@32 against baseline.
+3. Optional ablations (see MS3 §6.3): signal granularity, `prediction_length` ∈ {1,3,5}, temperature τ.
+4. Future-work metric design: preference-aware Recall/Pass that weights hits by engagement signal (MS3 §5.4).
 
 ## Dependencies
 
-Python 3.10+. Key packages: `pandas`, `pyarrow`, `numpy`, `huggingface_hub`. For DPO training (upcoming): `torch`, `transformers`, `trl`.
+Python 3.10+. Key packages:
+- Data / EDA: `pandas`, `pyarrow`, `numpy`, `huggingface_hub`, `matplotlib`
+- Training: `torch`, `transformers`, `peft`, `accelerate`, `tqdm`
 
 ## Commands
 
-Run EDA scripts (each is standalone, run from project root):
+EDA scripts (each standalone, run from project root):
 ```bash
-python notebook/eda_data_health.py        # → notebook/outputs/eda_data_health_report.txt
-python notebook/eda_behavior_signals.py   # → notebook/outputs/eda_behavior_signals_report.txt
-python notebook/eda_dpo_feasibility.py    # → notebook/outputs/eda_dpo_feasibility_report.txt
+python notebook/eda_data_health.py
+python notebook/eda_behavior_signals.py
+python notebook/eda_dpo_feasibility.py
 ```
 
-HF auth: token lives at `~/.cache/huggingface/token`. Dataset is gated — request access on the HF repo page first. `huggingface-cli` is not on PATH; use `python -c "from huggingface_hub import login; login()"` if re-auth needed (note: typer-version bug may force you to write the token file by hand).
+Build contrastive dataset:
+```bash
+python build_contrastive_dataset.py --length 1
+# → data/contrastive_dataset_v0/{train,valid}.parquet + meta.json
+```
+
+Train (single CUDA GPU; both model and template auto-resolved):
+```bash
+python train/train_contrastive.py \
+    --train_parquet data/contrastive_dataset_v0/train.parquet \
+    --valid_parquet data/contrastive_dataset_v0/valid.parquet \
+    --output_dir runs/contrastive_v0_lora \
+    --merge_and_save
+```
+
+Evaluate (baseline or trained checkpoint):
+```bash
+# baseline
+python train/evaluate_origin.py \
+    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
+    --n 100 --output_csv runs/eval_baseline.csv
+
+# trained
+python train/evaluate_origin.py \
+    --model_path runs/contrastive_v0_lora/merged \
+    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
+    --n 100 --output_csv runs/eval_contrastive_v0.csv
+```
+
+**Auto-resolution.** `--model_path` defaults to `OpenOneRec/OneRec-1.7B` and `from_pretrained` pulls from the HF Hub on first run. `--template` is resolved by [train/utils.py](train/utils.py) `resolve_template()` in this order: explicit CLI flag → `<project_root>/oneRec/qwen3_soft_switch.jinja2` → `~/.cache/onerec_template/qwen3_soft_switch.jinja2` → download from `https://raw.githubusercontent.com/Kuaishou-OneRec/OpenOneRec/main/benchmarks/benchmark/tasks/v1_0/qwen3_soft_switch.jinja2`. Override the URL with `ONEREC_TEMPLATE_URL` if upstream layout changes.
+
+HF auth: token lives at `~/.cache/huggingface/token`. The OpenOneRec-RecIF *dataset* is gated — request access on the HF repo page first. The OneRec-1.7B *model* is ungated. `huggingface-cli` is not always on PATH; use `python -c "from huggingface_hub import login; login()"` if re-auth needed.
 
 ## Conventions
 
-- All EDA filters to `split=0` only. Never touch `benchmark_data/` for training analysis — it is the held-out test set with 20% of users from the 200K-user pool, completely disjoint from the master table.
-- EDA scripts emit text reports to `notebook/outputs/` (or wherever EDA.md specifies); don't dump giant intermediate parquets.
-- Three-script structure (data_health → behavior_signals → dpo_feasibility) is a deliberate narrative — keep them independent so each can be re-run in isolation.
+- All EDA filters to `split=0` only. Never touch `benchmark_data/` for training analysis — it is the held-out test set, completely disjoint from the master table.
+- EDA scripts emit text reports to `notebook/outputs/`; don't dump giant intermediate parquets.
+- Three-script EDA structure (data_health → behavior_signals → dpo_feasibility) is a deliberate narrative — keep them independent so each can be re-run in isolation. The "dpo_feasibility" script is kept under its original name for git history; its findings now motivate the contrastive method.
+- Eval is **always** done with `train/evaluate_origin.py` on `video_test.parquet`, matching the official OneRec protocol (beam search 32, max_new_tokens=3, SID-string-level matching). Do not invent a custom split — use the published benchmark so numbers are comparable.
+- SID matching is at the **string level** (`<s_a_X><s_b_Y><s_c_Z>`), not at the PID level. The SID→PID mapping is many-to-one, so PID-level matching introduces ambiguity.
