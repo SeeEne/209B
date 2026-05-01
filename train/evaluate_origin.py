@@ -89,6 +89,14 @@ def main():
                         help="Number of samples (use -1 for full set)")
     parser.add_argument("--num_beams", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=3)
+    parser.add_argument(
+        "--cache_implementation",
+        choices=["dynamic", "offloaded"],
+        default="dynamic",
+        help="dynamic = standard GPU KV cache (fast, may OOM at high "
+             "num_beams). offloaded = KV cache on CPU, transferred per "
+             "layer; ~1s/sample slower but uses ~5x less VRAM.",
+    )
     parser.add_argument("--output_csv", default=None,
                         help="Where to write per-sample results CSV")
     parser.add_argument("--device", default="cuda")
@@ -110,12 +118,15 @@ def main():
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load directly onto GPU to avoid the CPU->GPU double-allocation,
+    # and force SDPA so beam search uses memory-efficient attention.
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    ).to(args.device)
+        device_map={"": args.device},
+        attn_implementation="sdpa",
+    )
     model.eval()
 
     for attr in ["temperature", "top_p", "top_k"]:
@@ -144,7 +155,7 @@ def main():
         inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         inputs = {k: v.to(args.device) for k, v in inputs.items()}
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=args.max_new_tokens,
@@ -153,6 +164,7 @@ def main():
                 num_return_sequences=args.num_beams,
                 early_stopping=True,
                 use_cache=True,
+                cache_implementation=args.cache_implementation,
                 pad_token_id=tokenizer.pad_token_id,
             )
 
@@ -183,6 +195,12 @@ def main():
         })
 
         del inputs, outputs, decoded
+        if (i + 1) % 5 == 0 or i == 0:
+            alloc = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(f"  [mem@{i+1:>3d}] alloc={alloc:5.2f}G  "
+                  f"reserved={reserved:5.2f}G  peak={peak:5.2f}G")
         if (i + 1) % 20 == 0:
             torch.cuda.empty_cache()
 

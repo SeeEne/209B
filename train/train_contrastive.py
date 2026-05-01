@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import json
+import time
 import warnings
 from functools import partial
 from pathlib import Path
@@ -37,39 +38,76 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 from transformers.utils import logging as hf_logging
 from utils import resolve_template
+
+
+class TimingCallback(TrainerCallback):
+    """Adds elapsed wall-clock and per-step time to each Trainer log line."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        self.last_log_time = self.start_time
+        self.last_log_step = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        now = time.time()
+        elapsed = int(now - self.start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        logs["elapsed"] = f"{h}:{m:02d}:{s:02d}"
+
+        steps_since = state.global_step - self.last_log_step
+        if steps_since > 0:
+            logs["sec/step"] = f"{(now - self.last_log_time) / steps_since:.2f}"
+        self.last_log_time = now
+        self.last_log_step = state.global_step
 
 # ---------------------------------------------------------------------------
 # Score / loss
 # ---------------------------------------------------------------------------
 
 
-def compute_sid_logprobs(logits, input_ids, prompt_lens, num_sid_tokens=3):
+def compute_sid_logprobs(last_hidden, lm_head, input_ids, prompt_lens,
+                         num_sid_tokens=3):
     """
-    logits   : (2B, L, V)
-    input_ids: (2B, L)  — first B = chosen, last B = rejected (same prompt prefix)
-    prompt_lens: (B,)   — shared prompt length
+    last_hidden : (2B, L, H)  — transformer output, BEFORE lm_head
+    lm_head     : nn.Linear   — maps H -> V
+    input_ids   : (2B, L)     — first B = chosen, last B = rejected
+    prompt_lens : (B,)        — shared prompt length
 
     Returns (chosen_score, rejected_score), each shape (B,).
+
+    Memory note: applying lm_head to the full (2B, L, H) would materialize
+    a (2B, L, V) tensor (~3 GB bf16 for Qwen3 V=152k at L=2600), and
+    backward needs its gradient = another ~3 GB. We instead gather hidden
+    states at the K predictor positions FIRST, then apply lm_head to just
+    (2B, K, H) — turning a multi-GB allocation into a few MB.
     """
-    log_probs = F.log_softmax(logits.float(), dim=-1)
     bsz = input_ids.size(0)
     half = bsz // 2
-    plens = torch.cat([prompt_lens, prompt_lens], dim=0)  # (2B,)
+    H = last_hidden.size(-1)
+    plens = torch.cat([prompt_lens, prompt_lens], dim=0)              # (2B,)
+    ks = torch.arange(num_sid_tokens, device=last_hidden.device)      # (K,)
+    pred_pos = plens.unsqueeze(1) - 1 + ks                            # (2B, K)
+    token_pos = plens.unsqueeze(1) + ks                               # (2B, K)
 
-    scores = torch.zeros(bsz, device=logits.device, dtype=torch.float32)
-    for k in range(num_sid_tokens):
-        pred_pos = plens - 1 + k  # logits index
-        token_pos = plens + k  # token index
-        idx = pred_pos.unsqueeze(1).unsqueeze(2).expand(-1, 1, log_probs.size(-1))
-        gathered = log_probs.gather(1, idx).squeeze(1)  # (2B, V)
-        target = input_ids.gather(1, token_pos.unsqueeze(1)).squeeze(1)
-        scores = scores + gathered.gather(1, target.unsqueeze(1)).squeeze(1)
+    # Gather hidden states at the K predictor positions: (2B, K, H).
+    idx = pred_pos.unsqueeze(-1).expand(-1, -1, H)
+    slice_hidden = last_hidden.gather(1, idx)                         # (2B, K, H)
+    # Apply lm_head ONLY to the K-row slice — output (2B, K, V), only ~MB.
+    slice_logits = lm_head(slice_hidden)
+    log_probs = F.log_softmax(slice_logits.float(), dim=-1)           # (2B, K, V)
 
-    scores = scores / num_sid_tokens
+    target_ids = input_ids.gather(1, token_pos)                       # (2B, K)
+    token_logp = log_probs.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (2B, K)
+
+    scores = token_logp.mean(dim=1)                                   # (2B,)
     return scores[:half], scores[half:]
 
 
@@ -97,12 +135,28 @@ class ContrastiveTrainer(Trainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         prompt_lens = inputs.pop("prompt_lens")
-        out = model(
+
+        # Skip the lm_head on the full sequence: it would produce a
+        # (2B, L, V) ~3 GB bf16 tensor (plus its gradient in backward).
+        # Walk the wrapping to grab the inner Qwen3Model + lm_head separately,
+        # then apply lm_head only to the K positions we score.
+        # PEFT wrapping: PeftModel -> LoraModel -> Qwen3ForCausalLM
+        causal_lm = (
+            model.get_base_model() if hasattr(model, "get_base_model") else model
+        )
+        transformer = causal_lm.model     # Qwen3Model (LoRA layers injected)
+        lm_head = causal_lm.lm_head       # Linear, no LoRA target
+
+        transformer_out = transformer(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
+            use_cache=False,
         )
+        last_hidden = transformer_out.last_hidden_state   # (2B, L, H) bf16
+
         chosen_s, rejected_s = compute_sid_logprobs(
-            out.logits,
+            last_hidden,
+            lm_head,
             inputs["input_ids"],
             prompt_lens,
         )
@@ -113,6 +167,14 @@ class ContrastiveTrainer(Trainer):
         if return_outputs:
             scores = torch.stack([chosen_s, rejected_s], dim=-1)  # (B, 2)
             return loss, {"scores": scores}
+        
+        if self.state.global_step % 100 == 0:
+            alloc = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(f"[mem] step={self.state.global_step} "
+                f"alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G")
+
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
@@ -164,9 +226,9 @@ def main():
     parser.add_argument("--output_dir", required=True)
 
     # Training
-    parser.add_argument("--epochs", type=float, default=2.0)
-    parser.add_argument("--per_device_batch_size", type=int, default=2)
-    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--per_device_batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum", type=int, default=2)
     parser.add_argument(
         "--lr",
         type=float,
@@ -187,6 +249,22 @@ def main():
                         help="Token-length safety cap. ~2600 tokens needed "
                              "for max_hist=512; leave headroom.")
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=-1,
+        help="Subsample train.parquet to this many pairs (deterministic, "
+             "seeded). -1 = use the full set. Useful for smoke tests, e.g. "
+             "5000 finishes one short epoch in ~30min on a 5090.",
+    )
+    parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=2000,
+        help="Subsample valid.parquet to this many pairs (deterministic, "
+             "seeded). -1 = use full valid set. 2000 gives ±1%% std error "
+             "on pref_acc and is ~7x faster than the full 13.9k.",
+    )
 
     # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
@@ -216,8 +294,8 @@ def main():
 
     # Logging
     parser.add_argument("--logging_steps", type=int, default=25)
-    parser.add_argument("--eval_steps", type=int, default=500)
-    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--eval_steps", type=int, default=1500)
+    parser.add_argument("--save_steps", type=int, default=1500)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
@@ -243,11 +321,24 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+
+    # Pick the fastest attention impl available. SDPA on PyTorch 2.x already
+    # dispatches to FlashAttention-2 kernels for bf16 on Ampere+ — explicit
+    # "flash_attention_2" only helps if flash-attn is installed natively
+    # (often a pain on Windows).
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "sdpa"
+    print(f"[attn] using attn_implementation={attn_impl}")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
         torch_dtype=torch_dtype,
         device_map={"": "cuda:0"},
+        attn_implementation=attn_impl,
     )
     if hasattr(model, "config"):
         model.config.use_cache = False  # required with grad checkpointing
@@ -296,7 +387,28 @@ def main():
         max_hist=args.max_hist,
         max_total_len=args.max_total_len,
     )
-    print(f"  train: {len(train_set):,} pairs  |  valid: {len(valid_set):,} pairs")
+
+    # Optional deterministic subsampling. We seed independently of args.seed
+    # so the same subset is selected regardless of training seed — this lets
+    # numbers from a smoke run and a full run be compared on the same valid
+    # subset.
+    def _subsample(ds, n, sampling_seed):
+        if n is None or n <= 0 or n >= len(ds):
+            return ds
+        rng = torch.Generator().manual_seed(sampling_seed)
+        indices = torch.randperm(len(ds), generator=rng)[:n].tolist()
+        return torch.utils.data.Subset(ds, indices)
+
+    train_full = len(train_set)
+    valid_full = len(valid_set)
+    train_set = _subsample(train_set, args.max_train_samples, sampling_seed=12345)
+    valid_set = _subsample(valid_set, args.max_eval_samples, sampling_seed=67890)
+
+    def _fmt(now, full):
+        return f"{now:,}" + (f" / {full:,}" if now < full else "")
+
+    print(f"  train: {_fmt(len(train_set), train_full)} pairs  |  "
+          f"valid: {_fmt(len(valid_set), valid_full)} pairs")
 
     collate = partial(contrastive_collate, pad_token_id=tokenizer.pad_token_id)
 
@@ -330,6 +442,7 @@ def main():
         remove_unused_columns=False,
         report_to=["none"],
         seed=args.seed,
+        optim="adamw_torch_fused",
     )
 
     trainer = ContrastiveTrainer(
@@ -340,6 +453,7 @@ def main():
         data_collator=collate,
         compute_metrics=compute_metrics,
         temperature=args.temperature,
+        callbacks=[TimingCallback()],
     )
 
     # ---- Train ----
@@ -349,7 +463,17 @@ def main():
     # ---- Final eval ----
     print("\n===== Final eval =====")
     metrics = trainer.evaluate()
-    print(json.dumps({k: float(v) for k, v in metrics.items()}, indent=2))
+
+    def _safe_serialize(v):
+        if isinstance(v, str):
+            return v
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    print(json.dumps({k: _safe_serialize(v) for k, v in metrics.items()},
+                     indent=2))
 
     # ---- Save adapter ----
     adapter_dir = out_dir / "adapter"

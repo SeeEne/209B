@@ -29,3 +29,5 @@ env/
 *.pt
 models/
 checkpoints/
+
+runs/*
