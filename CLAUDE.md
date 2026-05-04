@@ -4,169 +4,247 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project (current direction)
 
-CS 209B course project based on the **OpenOneRec** open-source dataset/framework (Kuaishou, 2025). The project replaces OneRec's separately-trained Reward Model with **direct user behavior signals** as the supervision source for preference alignment, using **contrastive learning** (not DPO — see "Method pivot" below).
+CS 209B course project based on the **OpenOneRec** open-source dataset/framework (Kuaishou, 2025). The project replaces OneRec's separately-trained Reward Model with **direct user behavior signals** as the supervision source for preference alignment.
 
 **Core research question:**
 > In offline recommendation, can user behavior signals (longview / like / follow / forward) directly replace the Reward Model when constructing preference pairs for alignment training?
 
-**Why this is novel.** OneRec's IPA module trains a separate Reward Model to score beam-search candidates because in their **online** setting user behaviors only arrive *after* recommendation. We work **offline** on logged data — every behavior signal is already in the parquet — so we can construct positive/negative pairs directly from behavior and skip the Reward Model entirely.
+**Why this is novel.** OneRec's IPA module trains a separate Reward Model to score beam-search candidates because in their **online** setting user behaviors only arrive *after* recommendation. We work **offline** on logged data — every behavior signal is already in the parquet — so we can construct positive/negative pairs directly from behavior.
 
-**Method pivot (DPO → contrastive).** The project originally targeted DPO. After EDA we abandoned DPO for two reasons documented in [notebook/eda_ms2.ipynb](notebook/eda_ms2.ipynb) and [oneRec/eda_findings.md](oneRec/eda_findings.md):
-1. Explicit `not_interested` is too sparse (0.06% item rate; ~515 users with both pos+neg) for DPO.
-2. Our top-m / bottom-m construction yields *synthetic* chosen sequences that never existed in the real log; DPO's likelihood-based loss penalizes this off-policy shift.
+## Current method: DPO + SFT anchor + group-normalized loss
 
-The current method is a **pairwise contrastive loss** on individual items (not sequences):
+Per-pair DPO loss (reference model's scores baked in as a baseline → implicit KL):
 ```
-score(item | history) = (1/3) * Σ_t log P(item_token_t | history, item_<t)
-L = -log_softmax([score+/τ, score-/τ])[0]
+margin_p = β × [(c_θ − c_ref) − (r_θ − r_ref)]
+L_dpo_p  = softplus(−margin_p)
 ```
-This sidesteps the synthetic-sequence problem (items, not sequences) and tolerates implicit negatives (no-signal items, which are abundant).
+
+GRPO-inspired group normalization. Each user contributes G=3 (chosen, rejected) pairs sharing a `group_id`; per-group std rescales the per-pair loss:
+```
+L_dpo_grpo = (L_dpo_pair.view(num_groups, G) / std_g.detach()).mean()
+```
+
+SFT anchor on chosen — keeps absolute P(chosen) up so the contrastive part can't be minimized by *lowering* both sides:
+```
+L_sft   = −c_θ.mean()
+L_total = L_dpo_grpo + sft_weight × L_sft
+```
+
+Standard hyperparameters: `--dpo_beta 0.1`, `--sft_weight 0.1`, `--kl_weight 0` (DPO has implicit KL).
+
+**Why this stack** — see [`archive/EXPERIMENTS.md`](archive/EXPERIMENTS.md) for the 7-step research journey. Short version:
+1. Pure contrastive (length=1) → mode collapse
+2. + KL → distribution recovers, but Recall@K still 0
+3. **Insight: Recall@K measures next-shown; we trained for engaged. Mismatched metric.**
+4. Build engagement-aware Δrecall metric on held-out contrastive valid
+5. Length=3 contrastive: clean directional reversal (Δpass +0.0080 vs baseline −0.020)
+6. Group normalization: matches length=3 30k Δ with 1/6 the data
+7. **Pure GRPO crashes chosen recall in absolute terms** → add SFT anchor + DPO formulation → current path.
+
+## Terminology note
+
+We call our group normalization "GRPO" in filenames (`_grpo_`), but **it isn't strictly GRPO**:
+- We don't sample rollouts (pairs are pre-constructed from data)
+- We don't subtract group mean as advantage (we'd get 0)
+- We use `1/std` as a *loss scaling factor*, not as advantage weight on policy gradient
+
+In writing/reports, call it **"group-normalized contrastive loss"** or **"GRPO-inspired"**. Filenames keep `_grpo_` for brevity.
 
 ## Data
 
-Dataset: `OpenOneRec/OpenOneRec-RecIF` (HF, gated). Already downloaded — minimal viable subset only:
+Source dataset: `OpenOneRec/OpenOneRec-RecIF` (HF, gated).
 
 ```
 data/OpenOneRec/
-├── onerec_bench_release.parquet      # master training table, 162,074 rows, 25 cols
-├── video_ad_pid2sid.parquet          # 15.9M video/ad pid → semantic ID (length-3 tuple)
+├── onerec_bench_release.parquet      # master training table, 162,074 rows
+├── video_ad_pid2sid.parquet          # 15.9M video/ad pid → semantic ID
 ├── product_pid2sid.parquet           # 2.1M product pid → semantic ID
 └── benchmark_data/
-    ├── video/video_test.parquet      # 38,781 rows  (the test set we evaluate on)
-    ├── ad/ad_test.parquet            # 27,677 rows
-    ├── product/product_test.parquet  # 27,910 rows
-    ├── sid2pid.json
-    └── sid2iid.json
+    ├── video/video_test.parquet      # 38,781 rows  (held-out, official benchmark)
+    └── ...
 ```
 
-Plus a derived training set built from the master table:
+Derived contrastive datasets:
 
 ```
-data/contrastive_dataset_v0/
-├── train.parquet                      # 125,031 (history, chosen_sid, rejected_sid) triples
-├── valid.parquet                      # 13,892 triples (10% holdout)
-└── meta.json                          # build config + skip counts
+data/contrastive_dataset_v1/          # ⭐ length=3 source — 3 chosen + 3 rejected per row
+│   ├── train.parquet  ~125k rows     # also feeds evaluate_engaged.py
+│   ├── valid.parquet  ~14k rows
+│   └── meta.json
+data/contrastive_dataset_v1_grpo/     # ⭐ G=3 per-pair format derived from v1
+│   ├── train.parquet  ~214k rows  (= 71k groups × 3 pairs)
+│   ├── valid.parquet
+│   └── meta.json
+data/contrastive_dataset_v1_grpo_g5/  # G=5 ablation (smoke only)
+data/contrastive_dataset_v0/          # length=1 (legacy, length=1 era)
 ```
 
-**Important schema notes:**
-- Repo SFT scripts only consume `split=0` rows — but in the HF release every row has `split=0`, so the filter is effectively a no-op.
-- `hist_video_*` / `target_video_*` behavior columns are `list<int64>` aligned 1:1 to `*_pid` (per-item labels, not aggregate counts).
-- `hist_ad_pid`, `hist_goods_pid`, `hist_longview_video_list` are `list<double>` (NaN-padded) — cast to int after filtering.
+**v1_grpo** is what the current trainer reads. **v1** is the source for `evaluate_engaged.py` (the engagement-aware metric needs the 3+3 chosen/rejected per user).
+
+**Schema notes:**
+- All rows have `split=0` in HF release; `split==0` filter is a no-op.
+- `target_video_*` behavior columns are `list<int64>` aligned 1:1 to `target_video_pid`.
 - `sid` is a `list<int64>` of length 3.
+- Benchmark `video_test.parquet` is **completely disjoint** from master in uids — engagement labels not recoverable for benchmark items via uid-join.
 
 ## Repo layout
 
 ```
 project/
-├── CLAUDE.md                              # this file
-├── build_contrastive_dataset.py           # builds contrastive_dataset_v0 from the master table
-├── notebook/
-│   ├── EDA.md                             # MS2 research-design spec (historical)
-│   ├── EDA_报告.md                         # MS2 findings summary (Chinese)
-│   ├── eda_data_health.py                 # MS2 Script 1
-│   ├── eda_behavior_signals.py            # MS2 Script 2
-│   ├── eda_dpo_feasibility.py             # MS2 Script 3 (DPO feasibility — kept for record)
-│   ├── eda_ms2.ipynb                      # MS2 narrative notebook (DPO → contrastive pivot story)
-│   ├── eda_story.ipynb                    # earlier narrative draft
-│   ├── ms3.ipynb                          # MS3 deliverable: EDA on contrastive set + baseline + pipeline
-│   ├── ms3_baseline.ipynb                 # standalone baseline run on video_test.parquet (GPU)
-│   └── outputs/                           # text reports from EDA scripts
+├── CLAUDE.md                                  # this file
+├── build_contrastive_dataset.py               # master → v1 (length=3) data
+├── build_contrastive_dataset_GRPO.py          # v1 → v1_grpo (per-pair, group_id, configurable G)
+├── merge_local.py                             # merge LoRA adapter into base for inference
+├── run_dpo_smoke.sh                           # main run script (5k smoke pipeline)
+│
 ├── train/
-│   ├── README.md                          # how to train + evaluate
-│   ├── dataset.py                         # ContrastiveDataset (builds OneRec-format prompts)
-│   ├── train_contrastive.py               # LoRA contrastive FT via HF Trainer + PEFT
-│   └── evaluate_origin.py                 # official-protocol Recall@K / Pass@K eval
-├── data/                                  # not in git
-│   ├── OpenOneRec/                        # downloaded HF dataset
-│   └── contrastive_dataset_v0/            # built by build_contrastive_dataset.py
-├── test_eda.ipynb                         # teammate's reference baseline (read-only)
-└── oneRec/
-    ├── *.pdf                              # OneRec tech report + dataset notes
-    ├── training_plan.md                   # current training plan (LoRA + contrastive)
-    └── eda_findings.md                    # MS2 EDA findings (history + DPO→contrastive pivot)
+│   ├── README.md
+│   ├── dataset.py                             # SYSTEM_PROMPT + helpers (used by trainer)
+│   ├── utils.py                               # resolve_template
+│   ├── train_contrastive_dpo_g_normalize.py   # ⭐ MAIN trainer (DPO + SFT + G-norm)
+│   ├── evaluate_engaged.py                    # ⭐ MAIN evaluator (engagement-aware Δrecall/Δpass)
+│   └── evaluate_origin.py                     # OneRec official Recall@K (baseline reproduction)
+│
+├── diagnose/                                  # diagnostic tools
+│   ├── README.md
+│   ├── compare_models.py                      # base vs trained logits + beam outputs
+│   └── debug_recall.py                        # quick OneRec baseline-reproduction sanity check
+│
+├── archive/                                   # superseded experiments + journey log
+│   ├── EXPERIMENTS.md                         # ⭐ 7-step research journey, file map, headline numbers
+│   ├── train_contrastive.py                   # length=1 (Step 1)
+│   ├── train_contrastive_length3.py           # length=3 (Step 3)
+│   ├── train_contrastive_grpo.py              # GRPO contrastive without DPO (Step 5)
+│   ├── evaluate_length3.py                    # length=3 evaluation
+│   ├── debug_pipeline.py                      # CPU pipeline test (length=1 era)
+│   ├── merge.py                               # Windows merge variant
+│   ├── run_all_evals.sh
+│   ├── run_grpo_g5_smoke.sh                   # G=5 ablation
+│   ├── run_grpo_50k_full.sh                   # GRPO-only 50k (killed)
+│   └── eval_grpo_50k_checkpoint.sh            # mid-training sanity check
+│
+├── notebook/                                  # MS2 EDA + MS3 narrative
+├── oneRec/                                    # template + planning docs
+├── data/                                      # not in git
+└── runs/                                      # experiment outputs (not in git)
 ```
 
-## Current status (2026-04-30)
+## Current status (2026-05-02)
 
-**MS2 (EDA) — DONE.** Reports in [notebook/outputs/](notebook/outputs/), narrative in [notebook/eda_ms2.ipynb](notebook/eda_ms2.ipynb).
-- Data is clean: 162,074 split=0 rows, 100% pid→sid coverage, 0 behavior/pid alignment mismatches, 156,245 usable users.
-- Behavior signals semantically validated: like/follow/forward lift longview rate 1.36–1.88×; not_interested suppresses to 0.66×.
-- Critical finding that triggered the DPO → contrastive pivot: target-side `not_interested` fires on only 0.06% of items.
+(See `archive/EXPERIMENTS.md` for full timeline.)
 
-**Contrastive dataset v0 — DONE.** Built by [build_contrastive_dataset.py](build_contrastive_dataset.py), `prediction_length=1`:
-- Positive item: `longview=1` OR `like=1` OR `follow=1` OR `forward=1`
-- Negative item: `not_interested=1` OR all 5 signals = 0
-- 138,923 pairs total (125,031 train / 13,892 valid), 85.7% user coverage.
+**Method finalized**: DPO + SFT anchor + group normalization. Code at `train/train_contrastive_dpo_g_normalize.py`.
 
-**Baseline evaluation — DONE.** OneRec-1.7B (no fine-tuning) on `video_test.parquet[:100]`:
-- Recall@32 = 0.0231, Pass@32 = 0.13, Pass@1 = 0.06
-- Reproduces official Table 4 numbers within sample-size variance — eval pipeline confirmed correct.
-- Code: [notebook/ms3_baseline.ipynb](notebook/ms3_baseline.ipynb), packaged as CLI in [train/evaluate_origin.py](train/evaluate_origin.py).
-
-**Training pipeline — READY (LoRA + HF Trainer + PEFT).** See [train/README.md](train/README.md).
-- `train_contrastive.py` defaults `--model_path` to `OpenOneRec/OneRec-1.7B` (auto-pulled from HF Hub on first run).
-- LoRA targets `q/k/v/o_proj` + `gate/up/down_proj` (Qwen-3 attention + MLP), `r=16`, `alpha=32`.
-- Eval-time metric driving best-checkpoint selection: `pref_acc` on the valid set (fraction where chosen_score > rejected_score).
-- Optionally `--merge_and_save` to write a fully-merged checkpoint that `evaluate_origin.py` can load directly.
+**Validated by smoke runs (5k samples each):**
+- length=3 30k full: Δpass=+0.0080, eval_pref_acc=0.674
+- GRPO 5k smoke (G=3): matched length=3 30k Δ with 1/6 data
+- G=5 ablation: G=5 worse than G=3 — variance reduction saturates beyond G=3 due to within-group correlation
+- GRPO 50k partial (step 2500): chosen recall **drops** from baseline 0.0093 → 0.0043 → motivated SFT anchor + DPO
 
 **Next steps:**
-1. Run LoRA contrastive FT on a CUDA GPU.
-2. Re-run `evaluate_origin.py` on the trained checkpoint, compare Recall@32 / Pass@32 against baseline.
-3. Optional ablations (see MS3 §6.3): signal granularity, `prediction_length` ∈ {1,3,5}, temperature τ.
-4. Future-work metric design: preference-aware Recall/Pass that weights hits by engagement signal (MS3 §5.4).
+1. DPO + SFT smoke (5k, ~5h on RTX 6000 Pro): `bash run_dpo_smoke.sh`
+2. If smoke shows chosen recall maintained or rising vs baseline → scale to 50k full
+3. Final ablation table for the report: baseline vs length=3 30k vs GRPO 5k vs DPO+SFT 50k
 
 ## Dependencies
 
-Python 3.10+. Key packages:
-- Data / EDA: `pandas`, `pyarrow`, `numpy`, `huggingface_hub`, `matplotlib`
-- Training: `torch`, `transformers`, `peft`, `accelerate`, `tqdm`
+Python 3.10+. Key packages: `torch`, `transformers`, `peft`, `accelerate`, `pandas`, `pyarrow`, `tqdm`, `huggingface_hub`.
 
 ## Commands
 
-EDA scripts (each standalone, run from project root):
+### Build data (only re-run if you need to rebuild)
+
 ```bash
-python notebook/eda_data_health.py
-python notebook/eda_behavior_signals.py
-python notebook/eda_dpo_feasibility.py
+python build_contrastive_dataset.py --length 3        # → data/contrastive_dataset_v1/
+python build_contrastive_dataset_GRPO.py --G 3        # v1 → data/contrastive_dataset_v1_grpo/
 ```
 
-Build contrastive dataset:
+### Train (DPO + SFT + group-normalized loss)
+
+Smoke pipeline (5000 groups, ~5h on RTX 6000 Pro):
+
 ```bash
-python build_contrastive_dataset.py --length 1
-# → data/contrastive_dataset_v0/{train,valid}.parquet + meta.json
+bash run_dpo_smoke.sh
 ```
 
-Train (single CUDA GPU; both model and template auto-resolved):
+Full hyperparameter form (override anything):
+
 ```bash
-python train/train_contrastive.py \
-    --train_parquet data/contrastive_dataset_v0/train.parquet \
-    --valid_parquet data/contrastive_dataset_v0/valid.parquet \
-    --output_dir runs/contrastive_v0_lora \
+python train/train_contrastive_dpo_g_normalize.py \
+    --model_path model/OneRec-1.7B \
+    --template model/qwen3_soft_switch.jinja2 \
+    --train_parquet data/contrastive_dataset_v1_grpo/train.parquet \
+    --valid_parquet data/contrastive_dataset_v1_grpo/valid.parquet \
+    --output_dir runs/dpo_grpo_50k \
+    --G 3 \
+    --max_train_groups 50000 --max_eval_groups 2000 \
+    --eval_steps 2500 --save_steps 2500 --logging_steps 50 \
+    --per_device_batch_size 12 --grad_accum 1 \
+    --lr 5e-5 --dpo_beta 0.1 --sft_weight 0.1 --kl_weight 0 \
     --merge_and_save
 ```
 
-Evaluate (baseline or trained checkpoint):
-```bash
-# baseline
-python train/evaluate_origin.py \
-    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
-    --n 100 --output_csv runs/eval_baseline.csv
+### Evaluate
 
-# trained
-python train/evaluate_origin.py \
-    --model_path runs/contrastive_v0_lora/merged \
-    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
-    --n 100 --output_csv runs/eval_contrastive_v0.csv
+**Engagement-aware (primary metric)** — runs on `contrastive_dataset_v1/valid.parquet`:
+
+```bash
+python train/evaluate_engaged.py \
+    --model_path runs/dpo_grpo_50k/merged \
+    --valid_parquet data/contrastive_dataset_v1/valid.parquet \
+    --template model/qwen3_soft_switch.jinja2 \
+    --n 5000 --num_beams 32 --topk 96 \
+    --output_csv runs/eval_engaged_50k.csv
 ```
 
-**Auto-resolution.** `--model_path` defaults to `OpenOneRec/OneRec-1.7B` and `from_pretrained` pulls from the HF Hub on first run. `--template` is resolved by [train/utils.py](train/utils.py) `resolve_template()` in this order: explicit CLI flag → `<project_root>/oneRec/qwen3_soft_switch.jinja2` → `~/.cache/onerec_template/qwen3_soft_switch.jinja2` → download from `https://raw.githubusercontent.com/Kuaishou-OneRec/OpenOneRec/main/benchmarks/benchmark/tasks/v1_0/qwen3_soft_switch.jinja2`. Override the URL with `ONEREC_TEMPLATE_URL` if upstream layout changes.
+**OneRec official Recall@K (secondary)** — comparable to paper Table 4:
 
-HF auth: token lives at `~/.cache/huggingface/token`. The OpenOneRec-RecIF *dataset* is gated — request access on the HF repo page first. The OneRec-1.7B *model* is ungated. `huggingface-cli` is not always on PATH; use `python -c "from huggingface_hub import login; login()"` if re-auth needed.
+```bash
+python train/evaluate_origin.py \
+    --model_path runs/dpo_grpo_50k/merged \
+    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
+    --template model/qwen3_soft_switch.jinja2 \
+    --n 100 --output_csv runs/eval_origin_50k.csv
+```
+
+### Merge LoRA adapter (if not done with --merge_and_save)
+
+```bash
+python merge_local.py \
+    --base model/OneRec-1.7B \
+    --adapter runs/<run_name>/adapter \
+    --out runs/<run_name>/merged
+```
+
+### Diagnostic tools
+
+```bash
+# Side-by-side base vs trained model outputs on benchmark prompts
+python diagnose/compare_models.py \
+    --trained runs/<run_name>/merged --num_beams 8 --max_new_tokens 13
+
+# Verify generation pipeline reproduces OneRec Table 4 baseline
+python diagnose/debug_recall.py --n 100
+```
+
+## Auto-resolution
+
+`--model_path` defaults to `OpenOneRec/OneRec-1.7B` (HF Hub) — but on offline servers always pass an explicit local path (`model/OneRec-1.7B`). Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to disable HF retry on offline boxes (the smoke `.sh` script does this).
+
+`--template` is resolved by [train/utils.py](train/utils.py) `resolve_template()` in this order: explicit CLI flag → `<project_root>/oneRec/qwen3_soft_switch.jinja2` → `~/.cache/onerec_template/qwen3_soft_switch.jinja2` → download from upstream GitHub. Override the URL with `ONEREC_TEMPLATE_URL`.
+
+HF auth: token at `~/.cache/huggingface/token`. The OneRec-1.7B model is ungated; OpenOneRec-RecIF *dataset* is gated.
 
 ## Conventions
 
-- All EDA filters to `split=0` only. Never touch `benchmark_data/` for training analysis — it is the held-out test set, completely disjoint from the master table.
-- EDA scripts emit text reports to `notebook/outputs/`; don't dump giant intermediate parquets.
-- Three-script EDA structure (data_health → behavior_signals → dpo_feasibility) is a deliberate narrative — keep them independent so each can be re-run in isolation. The "dpo_feasibility" script is kept under its original name for git history; its findings now motivate the contrastive method.
-- Eval is **always** done with `train/evaluate_origin.py` on `video_test.parquet`, matching the official OneRec protocol (beam search 32, max_new_tokens=3, SID-string-level matching). Do not invent a custom split — use the published benchmark so numbers are comparable.
-- SID matching is at the **string level** (`<s_a_X><s_b_Y><s_c_Z>`), not at the PID level. The SID→PID mapping is many-to-one, so PID-level matching introduces ambiguity.
+- **All EDA filters to `split=0`.** Never touch `benchmark_data/` for training analysis — it's the held-out test set, completely disjoint from master.
+- **Two evaluators, two purposes:**
+  - `train/evaluate_engaged.py` (Δrecall / Δpass) — **headline metric**, aligned with what we trained for
+  - `train/evaluate_origin.py` (Recall@K / Pass@K) — **secondary metric**, comparable to OneRec paper Table 4
+- **Don't run training experiments from `archive/`.** Those scripts produced known results; if you want to revisit, reference `archive/EXPERIMENTS.md` first.
+- **Group normalization terminology**: in code we call it `_grpo`, but it's *not* full GRPO. In writing, use **"group-normalized contrastive loss"** or **"GRPO-inspired"**.
+- **SID matching** is at the **string level** (`<s_a_X><s_b_Y><s_c_Z>`), not at the PID level (PID→SID is many-to-one).
+- **Three loss weights to keep in mind:**
+  - `--dpo_beta 0.1` — standard DPO scaling (DeepSeek/Llama-3 use this)
+  - `--sft_weight 0.1` — gentle anchor on chosen (raise if chosen recall drops)
+  - `--kl_weight 0` — explicit KL is **off** by default; DPO has implicit KL via ref baseline

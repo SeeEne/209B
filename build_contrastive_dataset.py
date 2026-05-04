@@ -15,7 +15,7 @@ Usage:
     python build_contrastive_dataset.py --length 3       # length=3
 
 Output:
-    data/contrastive_dataset_v0/
+    data/contrastive_dataset_v1/
         train.parquet   — 90% of pairs
         valid.parquet   — 10% of pairs
         meta.json       — config + counts
@@ -98,10 +98,10 @@ def main():
     pred_len = args.length
     assert 1 <= pred_len <= 5, "prediction length must be between 1 and 5"
 
-    out_dir = os.path.join(PROJECT_ROOT, "data", "contrastive_dataset_v0")
+    out_dir = os.path.join(PROJECT_ROOT, "data", "contrastive_dataset_v1")
 
     print("=" * 60)
-    print(f"Building contrastive dataset v0  (prediction_length={pred_len})")
+    print(f"Building contrastive dataset v1  (prediction_length={pred_len})")
     print("=" * 60)
 
     # Load data

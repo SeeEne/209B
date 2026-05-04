@@ -81,13 +81,15 @@ def compute_sid_logprobs(last_hidden, lm_head, input_ids, prompt_lens,
     input_ids   : (2B, L)     — first B = chosen, last B = rejected
     prompt_lens : (B,)        — shared prompt length
 
-    Returns (chosen_score, rejected_score), each shape (B,).
+    Returns (chosen_score, rejected_score, slice_log_probs):
+        scores      : (B,) chosen + (B,) rejected — mean log P over K SID tokens
+        slice_log_probs : (2B, K, V) full log-prob distribution at predictor
+                         positions, kept for the KL regularizer.
 
     Memory note: applying lm_head to the full (2B, L, H) would materialize
-    a (2B, L, V) tensor (~3 GB bf16 for Qwen3 V=152k at L=2600), and
-    backward needs its gradient = another ~3 GB. We instead gather hidden
-    states at the K predictor positions FIRST, then apply lm_head to just
-    (2B, K, H) — turning a multi-GB allocation into a few MB.
+    a (2B, L, V) tensor (~3 GB bf16 for Qwen3 V=152k at L=2600). We gather
+    hidden states at the K predictor positions FIRST, then apply lm_head to
+    just (2B, K, H) — turning a multi-GB allocation into a few MB.
     """
     bsz = input_ids.size(0)
     half = bsz // 2
@@ -108,7 +110,23 @@ def compute_sid_logprobs(last_hidden, lm_head, input_ids, prompt_lens,
     token_logp = log_probs.gather(2, target_ids.unsqueeze(-1)).squeeze(-1)  # (2B, K)
 
     scores = token_logp.mean(dim=1)                                   # (2B,)
-    return scores[:half], scores[half:]
+    return scores[:half], scores[half:], log_probs
+
+
+def ref_log_probs_at_sid_positions(logits_full, prompt_lens, num_sid_tokens=3):
+    """
+    Reference path: take full (2B, L, V) logits from the frozen ref model,
+    slice to (2B, K, V) at the K SID predictor positions, log_softmax in
+    fp32. Used inside torch.no_grad(), so the (2B, L, V) allocation is
+    transient.
+    """
+    V = logits_full.size(-1)
+    plens = torch.cat([prompt_lens, prompt_lens], dim=0)
+    ks = torch.arange(num_sid_tokens, device=logits_full.device)
+    pred_pos = plens.unsqueeze(1) - 1 + ks                            # (2B, K)
+    idx = pred_pos.unsqueeze(-1).expand(-1, -1, V)
+    slice_logits = logits_full.gather(1, idx)                         # (2B, K, V)
+    return F.log_softmax(slice_logits.float(), dim=-1)                # (2B, K, V)
 
 
 def contrastive_loss(chosen_score, rejected_score, temperature):
@@ -127,9 +145,12 @@ class ContrastiveTrainer(Trainer):
     Overrides prediction_step so eval reports preference accuracy.
     """
 
-    def __init__(self, *args, temperature=0.1, **kwargs):
+    def __init__(self, *args, temperature=0.1, ref_model=None, kl_weight=0.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.temperature = temperature
+        self.ref_model = ref_model
+        self.kl_weight = kl_weight
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -154,26 +175,54 @@ class ContrastiveTrainer(Trainer):
         )
         last_hidden = transformer_out.last_hidden_state   # (2B, L, H) bf16
 
-        chosen_s, rejected_s = compute_sid_logprobs(
+        chosen_s, rejected_s, trained_log_probs = compute_sid_logprobs(
             last_hidden,
             lm_head,
             inputs["input_ids"],
             prompt_lens,
         )
-        loss = contrastive_loss(chosen_s, rejected_s, self.temperature)
+
+        # Pair-wise contrastive: keep chosen_score > rejected_score.
+        l_contrast = contrastive_loss(chosen_s, rejected_s, self.temperature)
+        loss = l_contrast
+
+        # KL regularization against frozen reference model — anchors the full
+        # token distribution at SID positions to ref's, preventing the
+        # mode-collapse failure mode (all users → same popular SIDs) that
+        # pure contrastive admits.
+        l_kl = None
+        if self.ref_model is not None and self.kl_weight > 0:
+            with torch.no_grad():
+                ref_out = self.ref_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False,
+                )
+                ref_log_probs = ref_log_probs_at_sid_positions(
+                    ref_out.logits, prompt_lens
+                )
+            # Reverse KL: KL(trained || ref). Trained is encouraged to keep
+            # mass where ref does; mode collapse → high KL.
+            trained_probs = trained_log_probs.exp()
+            l_kl = (trained_probs * (trained_log_probs - ref_log_probs)) \
+                .sum(dim=-1).mean()
+            loss = loss + self.kl_weight * l_kl
+
         # Re-attach so prediction_step / metrics can see prompt_lens if needed.
         inputs["prompt_lens"] = prompt_lens
 
         if return_outputs:
             scores = torch.stack([chosen_s, rejected_s], dim=-1)  # (B, 2)
             return loss, {"scores": scores}
-        
+
         if self.state.global_step % 100 == 0:
             alloc = torch.cuda.memory_allocated() / 1e9
             reserved = torch.cuda.memory_reserved() / 1e9
             peak = torch.cuda.max_memory_allocated() / 1e9
+            extra = f" l_kl={l_kl.item():.3f}" if l_kl is not None else ""
             print(f"[mem] step={self.state.global_step} "
-                f"alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G")
+                  f"alloc={alloc:.2f}G reserved={reserved:.2f}G peak={peak:.2f}G "
+                  f"l_contrast={l_contrast.item():.3f}{extra}")
 
         return loss
 
@@ -238,6 +287,21 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=0.1,
+        help="Weight on KL(trained || ref) regularization at SID positions. "
+             "0 disables (pure contrastive — risk of mode collapse). "
+             "0.05–0.5 is the typical useful range.",
+    )
+    parser.add_argument(
+        "--ref_model_path",
+        default=None,
+        help="Path to frozen reference model for KL regularization. "
+             "Defaults to --model_path (the original base, before any "
+             "training). Ignored if --kl_weight 0.",
+    )
     parser.add_argument("--max_steps", type=int, default=-1)
 
     # Data
@@ -445,6 +509,23 @@ def main():
         optim="adamw_torch_fused",
     )
 
+    # ---- Reference model for KL regularization ----
+    ref_model = None
+    if args.kl_weight > 0:
+        ref_path = args.ref_model_path or args.model_path
+        print(f"Loading frozen reference model from {ref_path} "
+              f"(kl_weight={args.kl_weight}) ...")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            ref_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map={"": "cuda:0"},
+            attn_implementation=attn_impl,
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
     trainer = ContrastiveTrainer(
         model=model,
         args=training_args,
@@ -453,6 +534,8 @@ def main():
         data_collator=collate,
         compute_metrics=compute_metrics,
         temperature=args.temperature,
+        ref_model=ref_model,
+        kl_weight=args.kl_weight,
         callbacks=[TimingCallback()],
     )
 

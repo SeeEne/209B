@@ -1,127 +1,146 @@
 # Training & Evaluation
 
+Active code path: **DPO + SFT + group-normalized contrastive loss**.
+
+For history of how we got here (length=1 contrastive → KL → length=3 → group
+normalization → DPO+SFT), see [`../archive/EXPERIMENTS.md`](../archive/EXPERIMENTS.md).
+
 ## Files
 
-- `dataset.py` — `ContrastiveDataset` for `contrastive_dataset_v0`. Builds OneRec chat-format prompts (system + history) and tokenizes chosen / rejected SIDs sharing the same prefix.
-- `train_contrastive.py` — LoRA contrastive fine-tuning of OneRec-1.7B via HuggingFace Trainer + PEFT.
-- `evaluate_origin.py` — official-protocol Recall@K / Pass@K eval on `video_test.parquet` (mirrors `test_eda.ipynb`). Use the same script before and after training.
-- `utils.py` — `resolve_template()`: locates or downloads the `qwen3_soft_switch.jinja2` chat template (CLI flag → `<project>/oneRec/` → `~/.cache/onerec_template/` → GitHub raw fetch).
-- `debug_pipeline.py` — CPU-only smoke test of the whole stack (deps → template → tokenizer → dataset → collation → model load → LoRA → forward → loss → backward). Stops before training. Run this on your laptop before launching a GPU job.
+- `dataset.py` — `SYSTEM_PROMPT`, `build_history_text`, `sid_to_core_text`, and the legacy `ContrastiveDataset` class. The current trainer defines its own `ContrastiveDatasetGRPO` inline; this file is kept because the helpers are shared.
+- `utils.py` — `resolve_template()` for the OneRec chat template (CLI flag → project / cache → upstream GitHub).
+- `train_contrastive_dpo_g_normalize.py` — **MAIN trainer**. Loss = L_dpo_grpo + sft_weight × L_sft.
+- `evaluate_engaged.py` — **MAIN evaluator**. Reports recall_chosen, recall_rejected, and Δ on the held-out `contrastive_dataset_v1/valid.parquet`.
+- `evaluate_origin.py` — Official OneRec Recall@K / Pass@K on `video_test.parquet`. Use as a comparison-to-paper reference; the headline number is from `evaluate_engaged.py`.
 
-## Smoke test (CPU, no training)
+Older / experimental files (length=1, length=3 contrastive, GRPO-only, length=3 evaluator, CPU pipeline test) live in [`../archive/`](../archive/).
+
+## Quick start: smoke (recommended first run)
 
 ```bash
-# Full check — loads OneRec-1.7B in fp32 on CPU (~7 GB RAM, 1-2 min)
-python train/debug_pipeline.py
-
-# Data-only check — skip model load / forward / backward
-python train/debug_pipeline.py --skip_model
+bash run_dpo_smoke.sh   # from project root, ~5h on RTX 6000 Pro
 ```
 
-Each step prints `✓ PASS` or `✗ FAIL`. The final summary lists everything; exit code is 0 only if all steps pass. Use `--skip_model` if your machine can't afford ~7 GB RAM for the fp32 base model — the data and tokenization checks alone catch most bugs before you ship a GPU job.
-
-## Requirements
-
-```
-torch
-transformers
-peft
-accelerate
-pandas
-pyarrow
-tqdm
-```
+Trains 5000 groups (= 15,000 pairs at G=3), then runs `evaluate_engaged.py` for the engagement-aware Δrecall / Δpass numbers. Logs to `runs/dpo_grpo_smoke.log`.
 
 ## Loss
 
 Per pair `(history, chosen, rejected)`:
 
 ```
-score(item | history) = (1/3) * Σ_t log P(item_token_t | history, item_<t)
-
-L = -log_softmax([score+/τ, score-/τ])[0]
-  = log(1 + exp(-(score+ - score-)/τ))
+margin_p   = β × [(chosen_θ − chosen_ref) − (rejected_θ − rejected_ref)]
+L_dpo_p    = softplus(−margin_p)                                     # per pair
 ```
 
-Reported during training: per-step loss + `pref_acc` (fraction where `score+ > score-`).
+GRPO-inspired group normalization (each user contributes G=3 pairs sharing a `group_id`):
 
-## Train (LoRA + HF Trainer)
+```
+L_grouped  = L_dpo_pair.view(num_groups, G)
+std_g      = L_grouped.std(dim=-1).detach() + ε                       # ε=1e-3
+L_dpo_grpo = (L_grouped / std_g).mean()
+```
 
-Both `--model_path` and `--template` auto-resolve. The model defaults to `OpenOneRec/OneRec-1.7B` (auto-pulled from the HF Hub on first run). The template is found in this order:
-1. `--template` if explicitly provided
-2. `<project_root>/oneRec/qwen3_soft_switch.jinja2`
-3. `~/.cache/onerec_template/qwen3_soft_switch.jinja2`
-4. Downloaded from the OpenOneRec GitHub repo into (3) on first run
+SFT anchor pushes chosen probability up in absolute terms — without it, the contrastive part can be minimized by *lowering* both chosen and rejected (rejected lower) instead of raising chosen:
 
-So the minimal invocation is:
+```
+L_sft   = −chosen_θ.mean()
+L_total = L_dpo_grpo + sft_weight × L_sft
+```
+
+**No explicit KL by default.** DPO's reference baseline already saturates the sigmoid when trained drifts from ref, providing implicit KL. Set `--kl_weight > 0` only if you want extra constraint.
+
+## Train
 
 ```bash
-python train/train_contrastive.py \
-    --train_parquet data/contrastive_dataset_v0/train.parquet \
-    --valid_parquet data/contrastive_dataset_v0/valid.parquet \
-    --output_dir runs/contrastive_v0_lora \
+python train/train_contrastive_dpo_g_normalize.py \
+    --model_path model/OneRec-1.7B \
+    --template model/qwen3_soft_switch.jinja2 \
+    --train_parquet data/contrastive_dataset_v1_grpo/train.parquet \
+    --valid_parquet data/contrastive_dataset_v1_grpo/valid.parquet \
+    --output_dir runs/<run_name> \
+    --G 3 \
+    --max_train_groups 50000 --max_eval_groups 2000 \
+    --eval_steps 2500 --save_steps 2500 --logging_steps 50 \
+    --per_device_batch_size 12 --grad_accum 1 \
+    --lr 5e-5 --dpo_beta 0.1 --sft_weight 0.1 --kl_weight 0 \
     --merge_and_save
 ```
 
-Full hyperparameter form:
+For smoke runs override:
+- `--max_train_groups 5000` (15k pairs)
+- `--eval_steps 200 --save_steps 200`
+- `--logging_steps 25`
 
-```bash
-python train/train_contrastive.py \
-    --train_parquet data/contrastive_dataset_v0/train.parquet \
-    --valid_parquet data/contrastive_dataset_v0/valid.parquet \
-    --output_dir runs/contrastive_v0_lora \
-    --epochs 2 \
-    --per_device_batch_size 2 \
-    --grad_accum 8 \
-    --lr 2e-4 \
-    --temperature 0.1 \
-    --lora_r 16 --lora_alpha 32 --lora_dropout 0.05 \
-    --max_hist 512 --max_total_len 3072 \
-    --merge_and_save
-```
+**Reference model is always loaded** (DPO requires ref scores). Adds ~3.4 GB VRAM.
 
-If the auto-fetch URL ever breaks, set `ONEREC_TEMPLATE_URL` or drop the file at `<project_root>/oneRec/qwen3_soft_switch.jinja2` manually.
-
-Effective batch = `per_device_batch_size * grad_accum`. Gradient checkpointing on; bf16 weights/activations. LoRA targets `q/k/v/o_proj` and `gate/up/down_proj` (Qwen-3 attention + MLP).
-
-`runs/contrastive_v0_lora/` will hold:
+`runs/<name>/` contents after training:
 - `checkpoint-<step>/` — Trainer auto-checkpoints (rotated by `save_total_limit`)
-- `adapter/` — LoRA weights only (~50MB)
+- `adapter/` — best LoRA weights (`load_best_model_at_end=True`, `metric_for_best_model="eval_pref_acc"`)
 - `merged/` — base + adapter merged into a full model (only with `--merge_and_save`)
 - `config.json` — CLI args used
 
-**Best-checkpoint selection**: `load_best_model_at_end=True` with `metric_for_best_model="eval_pref_acc"`, so the final model is whichever checkpoint had the highest preference accuracy on `valid.parquet`.
-
-## Evaluate (before vs after)
+If you skipped `--merge_and_save`, run `merge_local.py` afterwards:
 
 ```bash
-# Baseline (auto-pulls model + template if not cached)
-python train/evaluate_origin.py \
-    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
-    --n 100 \
-    --output_csv runs/eval_baseline.csv
-
-# After contrastive training (use the merged checkpoint)
-python train/evaluate_origin.py \
-    --model_path runs/contrastive_v0_lora/merged \
-    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
-    --n 100 \
-    --output_csv runs/eval_contrastive_v0.csv
+python merge_local.py \
+    --base model/OneRec-1.7B \
+    --adapter runs/<run_name>/adapter \
+    --out runs/<run_name>/merged
 ```
 
-Use `--n -1` for the full 38,781-sample test set. If you skipped `--merge_and_save`, load the adapter manually:
+## Evaluate
 
-```python
-from peft import PeftModel
-base = AutoModelForCausalLM.from_pretrained(BASE_PATH, trust_remote_code=True, ...)
-model = PeftModel.from_pretrained(base, "runs/contrastive_v0_lora/adapter")
-model = model.merge_and_unload()
+### Engagement-aware (primary metric)
+
+`evaluate_engaged.py` runs on `contrastive_dataset_v1/valid.parquet` (held-out 10%, never seen during training). Each row has 3 chosen + 3 rejected; we compute recall against each set.
+
+```bash
+python train/evaluate_engaged.py \
+    --model_path runs/<run_name>/merged \
+    --valid_parquet data/contrastive_dataset_v1/valid.parquet \
+    --template model/qwen3_soft_switch.jinja2 \
+    --n 5000 --num_beams 32 --topk 96 \
+    --output_csv runs/eval_engaged_<run_name>.csv
 ```
+
+Output:
+```
+metric         CHOSEN    REJECTED     Δ (C - R)
+recall@96      ...       ...          ...
+pass@96        ...       ...          ...
+```
+
+**Δ > 0** means model ranks chosen items higher than rejected. **Baseline** (no FT) gives **Δ = −0.020** (biased toward rejected — OneRec was trained for next-shown). Goal: positive Δ AND `recall_chosen ≥ baseline 0.0093` (which is why we added the SFT anchor).
+
+### OneRec Recall@K (secondary metric, comparable to paper)
+
+```bash
+python train/evaluate_origin.py \
+    --model_path runs/<run_name>/merged \
+    --benchmark data/OpenOneRec/benchmark_data/video/video_test.parquet \
+    --template model/qwen3_soft_switch.jinja2 \
+    --n 100 --output_csv runs/eval_origin_<run_name>.csv
+```
+
+Baseline (no FT): Recall@32 ≈ 0.025, Pass@32 ≈ 0.15. After DPO+SFT training, this number is **expected to be lower** than baseline — that's the whole point of switching to engagement-aware evaluation. Report both numbers for context.
 
 ## Notes
 
-- `max_hist=512` keeps the full user history (OneRec's release is already capped at 512). This matches the eval-time prompt distribution exactly. Lower it only if you're OOM — but mind that training and eval will then see different context lengths.
+- `max_hist=512` keeps the full user history (matches eval-time prompt distribution).
 - `max_total_len=3072`: 512 history items × 5 tokens + chat template + 3 SID tokens ≈ 2600, with ~470 token headroom.
 - The 3 SID tokens scored are `<s_a_X><s_b_Y><s_c_Z>` — `<|sid_end|>` is omitted (deterministic).
-- Each example expands to 2 sequences (chosen + rejected) inside the model forward, so a `--per_device_batch_size 2` micro-batch processes 4 sequences at once.
-- LoRA LR (~2e-4) is intentionally higher than full-FT LR (~1e-5) — LoRA adapters need a stronger update to move from zero init.
+- Each pair forwards 2 trained sequences (chosen + rejected) AND 2 ref sequences. So `--per_device_batch_size 12` (= 4 users × G=3) processes 24 trained + 24 ref sequences per micro-batch.
+- DPO LR (5e-5) is intentionally lower than the contrastive era (2e-4) — DPO's ref baseline already provides a strong gradient direction; lower LR avoids overshoot.
+- LoRA targets `q/k/v/o_proj` and `gate/up/down_proj` (Qwen-3 attention + MLP). r=16, α=32.
+- `eps=1e-3` in the GRPO normalization caps the std-amplification factor at 1000× and avoids initial-step explosion when `std_g ≈ 0`.
+
+## Hyperparameter cheat sheet
+
+| Knob | Default | Tune up if … | Tune down if … |
+|---|---|---|---|
+| `--dpo_beta` | 0.1 | training too soft, model not learning | gradient explodes (β too large saturates sigmoid quickly) |
+| `--sft_weight` | 0.1 | chosen recall **drops** vs baseline | chosen recall too dominant, Δ shrinking |
+| `--kl_weight` | 0 | trained drifts too far from ref (rare with DPO) | (default 0 already off) |
+| `--lr` | 5e-5 | loss flat after warmup | grad_norm consistently > 30 (clipped to 1.0) |
+| `--G` | 3 | (G > 3 didn't help in our ablation; pairs in a group are too correlated) | (G < 3 loses normalization benefit) |
+| `--per_device_batch_size` | 12 | VRAM < 50 GB used → can go to 24 (8 users × 3) | OOM (drop to 6 = 2 users × 3) |
