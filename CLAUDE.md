@@ -30,7 +30,7 @@ L_sft   = −c_θ.mean()
 L_total = L_dpo_grpo + sft_weight × L_sft
 ```
 
-Standard hyperparameters: `--dpo_beta 0.1`, `--sft_weight 0.1`, `--kl_weight 0` (DPO has implicit KL).
+Standard hyperparameters: `--dpo_beta 0.1`, `--sft_weight 1.0 --sft_scale_mode match_dpo` (the SFT term is rescaled by `mean(1/std_g)` so 1.0 is the *true* relative magnitude vs `L_dpo_grpo`; bare `--sft_weight 0.1` was effectively ~1–3%), `--kl_weight 0` (DPO has implicit KL), `--group_norm_eps 0.05` (caps `1/std` at 20× — was 1e-3 → step-0 `l_dpo=693` explosion), `--group_norm_warmup 50` (skip group-norm during cold start when trained≈ref), `--best_metric chosen_score` (correlates with `recall_chosen`; old `eval_pref_acc` was decoupled).
 
 **Why this stack** — see [`archive/EXPERIMENTS.md`](archive/EXPERIMENTS.md) for the 7-step research journey. Short version:
 1. Pure contrastive (length=1) → mode collapse
@@ -108,6 +108,7 @@ project/
 ├── diagnose/                                  # diagnostic tools
 │   ├── README.md
 │   ├── compare_models.py                      # base vs trained logits + beam outputs
+│   ├── checkpoint_recall_trend.py             # engagement-aware recall across checkpoints (named-adapter swap, no merging)
 │   └── debug_recall.py                        # quick OneRec baseline-reproduction sanity check
 │
 ├── archive/                                   # superseded experiments + journey log
@@ -129,7 +130,7 @@ project/
 └── runs/                                      # experiment outputs (not in git)
 ```
 
-## Current status (2026-05-02)
+## Current status (2026-05-04)
 
 (See `archive/EXPERIMENTS.md` for full timeline.)
 
@@ -141,10 +142,13 @@ project/
 - G=5 ablation: G=5 worse than G=3 — variance reduction saturates beyond G=3 due to within-group correlation
 - GRPO 50k partial (step 2500): chosen recall **drops** from baseline 0.0093 → 0.0043 → motivated SFT anchor + DPO
 
+**Pipeline ready to launch**: `run_dpo_smoke.sh` is configured with the post-2026-05-04 fixes (`sft_scale_mode match_dpo`, `group_norm_eps 0.05`, `group_norm_warmup 50`, `best_metric chosen_score`, ref-score cache, batch=24). Wall clock ~3.5h first run, ~3h on cache hit.
+
 **Next steps:**
-1. DPO + SFT smoke (5k, ~5h on RTX 6000 Pro): `bash run_dpo_smoke.sh`
-2. If smoke shows chosen recall maintained or rising vs baseline → scale to 50k full
-3. Final ablation table for the report: baseline vs length=3 30k vs GRPO 5k vs DPO+SFT 50k
+1. Run the DPO + SFT smoke: `bash run_dpo_smoke.sh`
+2. Verify chosen recall holds or rises vs baseline 0.0093 (use `diagnose/checkpoint_recall_trend.py` to inspect the trajectory across the 5 checkpoints)
+3. If smoke clears the bar → scale to 50k full
+4. Final ablation table for the report: baseline vs length=3 30k vs GRPO 5k vs DPO+SFT 50k
 
 ## Dependencies
 
@@ -178,11 +182,24 @@ python train/train_contrastive_dpo_g_normalize.py \
     --output_dir runs/dpo_grpo_50k \
     --G 3 \
     --max_train_groups 50000 --max_eval_groups 2000 \
-    --eval_steps 2500 --save_steps 2500 --logging_steps 50 \
-    --per_device_batch_size 12 --grad_accum 1 \
-    --lr 5e-5 --dpo_beta 0.1 --sft_weight 0.1 --kl_weight 0 \
+    --num_checkpoints 5 --logging_steps 50 \
+    --per_device_batch_size 24 --grad_accum 1 \
+    --lr 5e-5 \
+    --dpo_beta 0.1 \
+    --sft_weight 1.0 --sft_scale_mode match_dpo \
+    --group_norm_eps 0.05 --group_norm_warmup 50 \
+    --best_metric chosen_score \
+    --kl_weight 0 \
     --merge_and_save
 ```
+
+Notes on the post-2026-05-04 flags (see `run_dpo_smoke.sh` header for the full rationale):
+- `--num_checkpoints 5` replaces manual `--eval_steps`/`--save_steps` — Trainer derives evenly-spaced ckpts.
+- `--per_device_batch_size 24` works because ref scores are pre-computed (the ref model is freed after the precompute pass), freeing ~3.4 GB VRAM.
+- `--sft_scale_mode match_dpo` rescales `L_sft` by `mean(1/std_g)` so `--sft_weight 1.0` is commensurate with `L_dpo_grpo`. Without this, the SFT contribution silently shrinks to ~1–3% of DPO.
+- `--group_norm_warmup 50` skips group-norm for the first 50 steps. At cold start trained≈ref → `std_g ≈ 0` → loss explodes; the warmup makes those steps plain DPO.
+- `--group_norm_eps 0.05` caps the `1/std` amplification factor at 20×. The old default `1e-3` (= 1000×) caused step-0 `l_dpo ≈ 693`.
+- `--best_metric chosen_score` selects the best ckpt by absolute chosen log-prob (correlates with `recall_chosen`). Old default `eval_pref_acc` measured *separation* and was decoupled from the headline metric.
 
 ### Evaluate
 
@@ -225,6 +242,16 @@ python diagnose/compare_models.py \
 
 # Verify generation pipeline reproduces OneRec Table 4 baseline
 python diagnose/debug_recall.py --n 100
+
+# Track recall_chosen / Δ across LoRA checkpoints (catches the GRPO-only failure
+# mode where margin grows but chosen recall drops in absolute terms)
+python diagnose/checkpoint_recall_trend.py \
+    --base model/OneRec-1.7B \
+    --adapters runs/<run_name>/checkpoint-600 runs/<run_name>/checkpoint-800 runs/<run_name>/checkpoint-1000 \
+    --include_base \
+    --template model/qwen3_soft_switch.jinja2 \
+    --n 1000 --num_beams 32 --topk 96 \
+    --output_csv runs/checkpoint_trend_<run_name>.csv
 ```
 
 ## Auto-resolution
@@ -234,6 +261,18 @@ python diagnose/debug_recall.py --n 100
 `--template` is resolved by [train/utils.py](train/utils.py) `resolve_template()` in this order: explicit CLI flag → `<project_root>/oneRec/qwen3_soft_switch.jinja2` → `~/.cache/onerec_template/qwen3_soft_switch.jinja2` → download from upstream GitHub. Override the URL with `ONEREC_TEMPLATE_URL`.
 
 HF auth: token at `~/.cache/huggingface/token`. The OneRec-1.7B model is ungated; OpenOneRec-RecIF *dataset* is gated.
+
+### Ref-score cache
+
+Reference-model log-probs (`c_ref`, `r_ref`) are precomputed once and cached to `data/contrastive_dataset_v1_grpo/_ref_cache/`. The ref model is then freed before training starts.
+
+- **First run**: ~30 min precompute (full pass over all groups under the configured `max_train_groups` / `max_hist`).
+- **Subsequent runs**: ~1 sec load — cache hits whenever data and prompt construction are unchanged.
+- **Stays hot when tuning**: `--sft_weight`, `--dpo_beta`, `--lr`, `--group_norm_*`, `--best_metric` (anything that doesn't change ref inputs).
+- **Invalidates on**: `--max_train_groups` / `--max_eval_groups` (different row subset), `--max_hist` (different prompt length), `--model_path` (different ref weights), `--template` (different prompt format).
+- **To force rebuild**: `rm -rf data/contrastive_dataset_v1_grpo/_ref_cache/`.
+
+This cache is the reason hyperparameter sweeps are fast — keep it in mind when changing flags.
 
 ## Conventions
 
@@ -246,5 +285,5 @@ HF auth: token at `~/.cache/huggingface/token`. The OneRec-1.7B model is ungated
 - **SID matching** is at the **string level** (`<s_a_X><s_b_Y><s_c_Z>`), not at the PID level (PID→SID is many-to-one).
 - **Three loss weights to keep in mind:**
   - `--dpo_beta 0.1` — standard DPO scaling (DeepSeek/Llama-3 use this)
-  - `--sft_weight 0.1` — gentle anchor on chosen (raise if chosen recall drops)
+  - `--sft_weight 1.0 --sft_scale_mode match_dpo` — anchor on chosen, rescaled to match `L_dpo_grpo` magnitude. Raise if chosen recall drops; lower if Δ shrinks because SFT dominates. (Without `match_dpo`, you'd want ~10–30 to get the same effect — the old `0.1` was effectively ~1–3%.)
   - `--kl_weight 0` — explicit KL is **off** by default; DPO has implicit KL via ref baseline
