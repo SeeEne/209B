@@ -1,0 +1,58 @@
+[project]
+name = "onerec-209b"
+version = "0.1.0"
+description = "CS 209B project — preference alignment on OpenOneRec without a separately-trained reward model. SFT / DPO / ORPO trainers + engagement-aware evaluator."
+requires-python = ">=3.10,<3.13"
+authors = [
+    { name = "Ender Yang", email = "eenderyang@gmail.com" },
+]
+
+# NOTE on torch:
+#   torch is NOT pinned here because the right wheel depends on the host's
+#   CUDA version. Install it FIRST, separately, with the correct index URL,
+#   before `pip install -e .`:
+#
+#     # CUDA 12.1 host (matches A100/H100 servers we use):
+#     pip install "torch==2.4.*" --index-url https://download.pytorch.org/whl/cu121
+#
+#   Then:
+#     pip install -e .
+#
+# transformers 4.44+ is required: the trainer uses the
+# compute_loss(model, inputs, return_outputs, num_items_in_batch=...)
+# signature added in 4.40 and stabilized in 4.44.
+dependencies = [
+    "transformers>=4.44,<4.50",
+    "peft>=0.12,<0.14",
+    "accelerate>=0.33,<1.0",
+    "datasets>=2.20",
+    "huggingface_hub>=0.24,<0.27",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "numpy>=1.26,<2.1",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Optional: flash-attn 2 → ~1.4× speedup on the 1.7B forward.
+# Trainers fall back to sdpa automatically when this isn't installed,
+# so a missing flash-attn is never a hard error.
+flash = [
+    "flash-attn>=2.5; platform_system == 'Linux'",
+]
+# Notebook / EDA bits — not needed for training or evaluation.
+notebook = [
+    "jupyter>=1.0",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# This repo is a flat collection of scripts (train/, diagnose/, top-level
+# build_*.py). It's installed in editable mode for path resolution; nothing
+# is published as a package.
+py-modules = []

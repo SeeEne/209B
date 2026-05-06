@@ -31,8 +31,8 @@
 # under data/contrastive_dataset_v1_grpo/_ref_cache/ — Stage 2's cache key
 # includes ref_model_path, so a fresh SFT checkpoint always invalidates.
 #
-# Usage:
-#     bash run_sequential_smoke.sh
+# Usage (run from project root):
+#     bash scripts/run_sequential_smoke.sh
 #
 # Each step writes its own log under runs/eval_logs/ or runs/<run>/.
 
@@ -48,7 +48,7 @@ export TRANSFORMERS_OFFLINE=1
 export OMP_NUM_THREADS=8
 
 # ---- Paths ----
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 DATA_GRPO="data/contrastive_dataset_v1_grpo"

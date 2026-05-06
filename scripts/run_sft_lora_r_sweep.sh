@@ -38,7 +38,7 @@ export TRANSFORMERS_OFFLINE=1
 export OMP_NUM_THREADS=8
 
 # ---- Paths ----
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 DATA_GRPO="data/contrastive_dataset_v1_grpo"

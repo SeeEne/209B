@@ -23,8 +23,8 @@
 #   weight_decay=0.0, max_grad_norm=1.0, lora_r=16, alpha=32, dropout=0.05,
 #   epochs=1, num_checkpoints=5, sft_loss_scale=16.0, seed=42.
 #
-# Usage:
-#     bash run_sft_lr_sweep.sh
+# Usage (run from project root):
+#     bash scripts/run_sft_lr_sweep.sh
 #
 # Total wall clock ~3h on RTX 6000 Pro / H100 (1.5h × 2 lr values).
 # Each run skips if its output dir already exists (resume-friendly).
@@ -38,7 +38,7 @@ export TRANSFORMERS_OFFLINE=1
 export OMP_NUM_THREADS=8
 
 # ---- Paths ----
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 DATA_GRPO="data/contrastive_dataset_v1_grpo"

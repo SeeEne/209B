@@ -41,6 +41,21 @@ Standard hyperparameters: `--dpo_beta 0.1`, `--sft_weight 1.0 --sft_scale_mode m
 6. Group normalization: matches length=3 30k Δ with 1/6 the data
 7. **Pure GRPO crashes chosen recall in absolute terms** → add SFT anchor + DPO formulation → current path.
 
+## ORPO arm (alternative single-stage formulation)
+
+ORPO (Hong et al. 2024) folds preference learning into the SFT loss with **no reference model**, using a log-odds-ratio term:
+
+```
+log_odds_θ(y|x) = log P_θ(y|x) − log(1 − P_θ(y|x))
+ratio           = log_odds_θ(c|x) − log_odds_θ(r|x)
+L_ORPO          = −mean log P_θ(c|x)        # NLL term, same as our SFT
+                  + λ × −mean log σ(ratio)  # OR term
+```
+
+Why it's worth running here: no ref model → no `_ref_cache/` precompute, ~50% less peak VRAM, single stage from base. If it matches or beats SFT-only at the same data scale, it's the simpler default for this offline behavior-signal regime. Trainer at [`train/train_orpo.py`](train/train_orpo.py); smoke at [`scripts/run_orpo_smoke.sh`](scripts/run_orpo_smoke.sh) (5k, ~1.5h on A100 80GB). λ default 0.1 (paper).
+
+Implementation note: log_odds is computed with a numerically stable `log1mexp` (Mächler 2012) — log P close to 0 would otherwise produce −∞. On this task log P ≈ −4.84 nats, far from saturation, but the guard is essentially free.
+
 ## Terminology note
 
 We call our group normalization "GRPO" in filenames (`_grpo_`), but **it isn't strictly GRPO**:
@@ -92,16 +107,24 @@ data/contrastive_dataset_v0/          # length=1 (legacy, length=1 era)
 ```
 project/
 ├── CLAUDE.md                                  # this file
+├── pyproject.toml                             # ⭐ deps for new server setup (pip install -e .)
 ├── build_contrastive_dataset.py               # master → v1 (length=3) data
 ├── build_contrastive_dataset_GRPO.py          # v1 → v1_grpo (per-pair, group_id, configurable G)
 ├── merge_local.py                             # merge LoRA adapter into base for inference
-├── run_dpo_smoke.sh                           # main run script (5k smoke pipeline)
+├── scripts/                                   # all run_*.sh launchers (run from project root)
+│   ├── run_dpo_smoke.sh                       # DPO+SFT joint smoke (5k, primary path)
+│   ├── run_sft_50k.sh / run_sft_*_sweep.sh    # SFT-only ablation arm (lr/r sweeps + 50k full)
+│   ├── run_sequential_smoke.sh                # sequential SFT → DPO ablation arm
+│   └── run_orpo_smoke.sh                      # ⭐ ORPO ablation arm (single-stage, no ref)
 │
 ├── train/
 │   ├── README.md
-│   ├── dataset.py                             # SYSTEM_PROMPT + helpers (used by trainer)
+│   ├── dataset.py                             # SYSTEM_PROMPT + helpers (used by all trainers)
 │   ├── utils.py                               # resolve_template
 │   ├── train_contrastive_dpo_g_normalize.py   # ⭐ MAIN trainer (DPO + SFT + G-norm)
+│   ├── train_sft_only.py                      # Stage 1 / SFT-only ablation
+│   ├── train_dpo_from_sft.py                  # Stage 2 / DPO from SFT init
+│   ├── train_orpo.py                          # ⭐ single-stage ORPO (no ref model)
 │   ├── evaluate_engaged.py                    # ⭐ MAIN evaluator (engagement-aware Δrecall/Δpass)
 │   └── evaluate_origin.py                     # OneRec official Recall@K (baseline reproduction)
 │
@@ -109,6 +132,7 @@ project/
 │   ├── README.md
 │   ├── compare_models.py                      # base vs trained logits + beam outputs
 │   ├── checkpoint_recall_trend.py             # engagement-aware recall across checkpoints (named-adapter swap, no merging)
+│   ├── sft_score_trend.py                     # fast forward-only chosen/rejected score trend (no beam)
 │   └── debug_recall.py                        # quick OneRec baseline-reproduction sanity check
 │
 ├── archive/                                   # superseded experiments + journey log
@@ -130,29 +154,65 @@ project/
 └── runs/                                      # experiment outputs (not in git)
 ```
 
-## Current status (2026-05-04)
+## Current status (2026-05-06)
 
 (See `archive/EXPERIMENTS.md` for full timeline.)
 
-**Method finalized**: DPO + SFT anchor + group normalization. Code at `train/train_contrastive_dpo_g_normalize.py`.
+**Three ablation arms now in place**, sharing the same `data/contrastive_dataset_v1_grpo` 5k subset (deterministic via `subsample_seed`):
 
-**Validated by smoke runs (5k samples each):**
+| Arm | Trainer | Loss | Ref model | Group norm |
+|-----|---------|------|-----------|------------|
+| DPO+SFT joint | `train_contrastive_dpo_g_normalize.py` | `L_dpo_grpo + λ·L_sft` | yes (cached) | yes |
+| SFT → DPO sequential | `train_sft_only.py` → `train_dpo_from_sft.py` | stage-isolated | stage 2 only | stage 2 only |
+| SFT-only | `train_sft_only.py` | `L_sft` (16× scale) | no | no |
+| ORPO | `train_orpo.py` | `L_NLL + λ·L_OR` | no | no |
+
+**Empirical findings (5k smoke):**
 - length=3 30k full: Δpass=+0.0080, eval_pref_acc=0.674
-- GRPO 5k smoke (G=3): matched length=3 30k Δ with 1/6 data
-- G=5 ablation: G=5 worse than G=3 — variance reduction saturates beyond G=3 due to within-group correlation
-- GRPO 50k partial (step 2500): chosen recall **drops** from baseline 0.0093 → 0.0043 → motivated SFT anchor + DPO
+- GRPO 5k (G=3): matched length=3 30k Δ with 1/6 data
+- G=5 ablation: G=5 worse than G=3 — variance reduction saturates due to within-group correlation
+- GRPO 50k partial: chosen recall drops 0.0093 → 0.0043 → motivated SFT anchor
+- DPO+SFT joint 5k: Δ improves but eval_pref_acc only 0.546 (sft_scale_mode match_dpo overpowers DPO discriminative signal)
+- SFT-only 5k sweep: lr ∈ {5e-5, 2e-4, 5e-4} all converge to chosen_score ≈ −4.84; LoRA r=16 → 32 changes chosen by 0.002 nats (noise) → **5k ceiling = data, not optimization**
 
-**Pipeline ready to launch**: `run_dpo_smoke.sh` is configured with the post-2026-05-04 fixes (`sft_scale_mode match_dpo`, `group_norm_eps 0.05`, `group_norm_warmup 50`, `best_metric chosen_score`, ref-score cache, batch=24). Wall clock ~3.5h first run, ~3h on cache hit.
+**In-flight (2026-05-06):**
+- 50k SFT (`scripts/run_sft_50k.sh`, ~17h on RTX 6000 Pro / H100) — testing whether 10× data breaks the −4.84 ceiling.
+- 5k ORPO (`scripts/run_orpo_smoke.sh`, ~1.5h on A100 80GB) — separate server, single-stage from base, no ref model. λ=0.1 (paper default).
 
-**Next steps:**
-1. Run the DPO + SFT smoke: `bash run_dpo_smoke.sh`
-2. Verify chosen recall holds or rises vs baseline 0.0093 (use `diagnose/checkpoint_recall_trend.py` to inspect the trajectory across the 5 checkpoints)
-3. If smoke clears the bar → scale to 50k full
-4. Final ablation table for the report: baseline vs length=3 30k vs GRPO 5k vs DPO+SFT 50k
+**Decision logic for next steps:**
+1. SFT-50k breaks ceiling → run Stage 2 DPO from SFT-50k → final ablation table.
+2. ORPO 5k beats SFT-only 5k → scale ORPO to 50k.
+3. Both stay at ≈ −4.84 → reconsider OneRec base or eval methodology.
 
 ## Dependencies
 
-Python 3.10+. Key packages: `torch`, `transformers`, `peft`, `accelerate`, `pandas`, `pyarrow`, `tqdm`, `huggingface_hub`.
+Python 3.10–3.12. All runtime deps are declared in [`pyproject.toml`](pyproject.toml).
+
+**Setup on a fresh server (e.g. A100 80GB, Ubuntu 22, CUDA 12):**
+
+```bash
+# 1) Install torch FIRST with the CUDA-matched wheel (NOT pinned in pyproject):
+pip install "torch==2.4.*" --index-url https://download.pytorch.org/whl/cu121
+
+# 2) Then install the rest (editable so train/, diagnose/ stay importable):
+pip install -e .
+
+# 3) Optional: flash-attn 2 for ~1.4× faster forward (Linux only).
+#    Trainers fall back to sdpa automatically if absent — never a hard error.
+pip install -e ".[flash]"
+
+# 4) Sanity check the env:
+python -c "
+import torch, transformers, peft, accelerate, pandas, pyarrow
+print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.version.cuda)
+print('transformers', transformers.__version__, 'peft', peft.__version__)
+print('GPU', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')
+"
+```
+
+**transformers ≥ 4.44 is a hard requirement** — `Trainer.compute_loss` uses the `num_items_in_batch` kwarg added in 4.40 and stabilized in 4.44.
+
+**Files to ship to a fresh server**: `model/OneRec-1.7B/`, `model/qwen3_soft_switch.jinja2`, `data/contrastive_dataset_v1_grpo/`, `data/contrastive_dataset_v1/`, plus the repo source. Do **not** ship `runs/` (outputs) or `data/contrastive_dataset_v1_grpo/_ref_cache/` (DPO-only cache; ORPO doesn't use it).
 
 ## Commands
 
@@ -168,7 +228,7 @@ python build_contrastive_dataset_GRPO.py --G 3        # v1 → data/contrastive_
 Smoke pipeline (5000 groups, ~5h on RTX 6000 Pro):
 
 ```bash
-bash run_dpo_smoke.sh
+bash scripts/run_dpo_smoke.sh
 ```
 
 Full hyperparameter form (override anything):
@@ -193,7 +253,7 @@ python train/train_contrastive_dpo_g_normalize.py \
     --merge_and_save
 ```
 
-Notes on the post-2026-05-04 flags (see `run_dpo_smoke.sh` header for the full rationale):
+Notes on the post-2026-05-04 flags (see `scripts/run_dpo_smoke.sh` header for the full rationale):
 - `--num_checkpoints 5` replaces manual `--eval_steps`/`--save_steps` — Trainer derives evenly-spaced ckpts.
 - `--per_device_batch_size 24` works because ref scores are pre-computed (the ref model is freed after the precompute pass), freeing ~3.4 GB VRAM.
 - `--sft_scale_mode match_dpo` rescales `L_sft` by `mean(1/std_g)` so `--sft_weight 1.0` is commensurate with `L_dpo_grpo`. Without this, the SFT contribution silently shrinks to ~1–3% of DPO.
@@ -223,6 +283,39 @@ python train/evaluate_origin.py \
     --template model/qwen3_soft_switch.jinja2 \
     --n 100 --output_csv runs/eval_origin_50k.csv
 ```
+
+### Train (ORPO — single-stage, no ref model)
+
+Smoke pipeline (5000 groups, ~1.5h on A100 80GB):
+
+```bash
+bash scripts/run_orpo_smoke.sh
+```
+
+Full hyperparameter form:
+
+```bash
+python train/train_orpo.py \
+    --model_path model/OneRec-1.7B \
+    --template model/qwen3_soft_switch.jinja2 \
+    --train_parquet data/contrastive_dataset_v1_grpo/train.parquet \
+    --valid_parquet data/contrastive_dataset_v1_grpo/valid.parquet \
+    --output_dir runs/orpo_5k \
+    --max_train_groups 5000 --max_eval_groups 1000 \
+    --num_checkpoints 5 --logging_steps 25 \
+    --per_device_batch_size 24 --grad_accum 1 \
+    --lr 5e-5 \
+    --lambda_or 0.1 \
+    --nll_loss_scale 1.0 \
+    --lora_r 16 --lora_alpha 32 \
+    --best_metric chosen_score \
+    --merge_and_save
+```
+
+Key knobs:
+- `--lambda_or 0.1` — weight on the odds-ratio term. Paper range 0.1–1.0. Larger = more discriminative pressure; smaller = closer to pure SFT.
+- `--nll_loss_scale 1.0` — paper formulation. Set to 16.0 *only* if you also want to match the SFT-only ablation's `match_dpo` scaling — but then you should rescale `lambda_or` to keep the OR/NLL ratio you want.
+- No `--ref_model_path`, no `--group_norm_*`, no `--dpo_beta` — ORPO has none of those.
 
 ### Merge LoRA adapter (if not done with --merge_and_save)
 
@@ -287,3 +380,4 @@ This cache is the reason hyperparameter sweeps are fast — keep it in mind when
   - `--dpo_beta 0.1` — standard DPO scaling (DeepSeek/Llama-3 use this)
   - `--sft_weight 1.0 --sft_scale_mode match_dpo` — anchor on chosen, rescaled to match `L_dpo_grpo` magnitude. Raise if chosen recall drops; lower if Δ shrinks because SFT dominates. (Without `match_dpo`, you'd want ~10–30 to get the same effect — the old `0.1` was effectively ~1–3%.)
   - `--kl_weight 0` — explicit KL is **off** by default; DPO has implicit KL via ref baseline
+- **ORPO is a parallel arm, not a replacement.** The DPO+SFT joint trainer remains the primary path; ORPO is run on a separate server to test whether dropping the ref model and merging stages costs anything in this offline behavior-signal regime. They are evaluated by the SAME engagement-aware metric, so results go side-by-side in the final ablation table.
