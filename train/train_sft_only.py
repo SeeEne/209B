@@ -62,11 +62,9 @@ import warnings
 from functools import partial
 from pathlib import Path
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -76,7 +74,7 @@ from transformers import (
 )
 from transformers.utils import logging as hf_logging
 
-from dataset import SYSTEM_PROMPT, build_history_text, sid_to_core_text
+from dataset import ChosenSIDDataset, chosen_collate
 from utils import resolve_template
 
 
@@ -103,113 +101,9 @@ class TimingCallback(TrainerCallback):
         self.last_log_step = state.global_step
 
 
-# ===========================================================================
-# Dataset — chosen-only view of v1_grpo
-# ===========================================================================
-
-
-class SFTChosenDataset(Dataset):
-    """
-    Reads contrastive_dataset_v1_grpo and yields ONLY (history, chosen_sid)
-    examples. The rejected_sid column is present in the parquet but ignored
-    here — this is the core point of the SFT-only ablation.
-
-    With G=3 (cyclic-shift-1 pairing), each group's 3 rows have 3 distinct
-    chosens, so reading every row gives 3 distinct positives per user. No
-    duplicate-chosen training signal.
-    """
-
-    def __init__(self, parquet_path, tokenizer,
-                 max_hist=512, max_total_len=3072):
-        # Sort by (group_id, g) so subsample_groups can rely on "every G=3
-        # consecutive rows = one group_id". Matches GRPOPairDataset (Stage 2)
-        # so both stages see the SAME 5000 users when seeded identically.
-        # Without this, Stage 1 and Stage 2 silently sample disjoint subsets
-        # if the parquet rows are ever stored in non-(group_id, g) order.
-        df = pd.read_parquet(parquet_path)
-        if "group_id" in df.columns and "g" in df.columns:
-            df = df.sort_values(["group_id", "g"])
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.max_hist = max_hist
-        self.max_total_len = max_total_len
-
-    def __len__(self):
-        return len(self.df)
-
-    def subsample_groups(self, n_groups, G_per_group, seed):
-        """Match v1_grpo's group structure. Subsamples whole groups (G rows
-        each) so that the total stays divisible by G — preserves comparability
-        with the DPO trainer's subsampling."""
-        n_total_groups = len(self.df) // G_per_group
-        if n_groups >= n_total_groups:
-            return self
-        rng = torch.Generator().manual_seed(seed)
-        all_groups = torch.randperm(n_total_groups, generator=rng).tolist()
-        chosen = sorted(all_groups[:n_groups])
-        keep_indices = []
-        for gid in chosen:
-            for g in range(G_per_group):
-                keep_indices.append(gid * G_per_group + g)
-        new_df = self.df.iloc[keep_indices].reset_index(drop=True)
-        new_ds = object.__new__(SFTChosenDataset)
-        new_ds.df = new_df
-        new_ds.tokenizer = self.tokenizer
-        new_ds.max_hist = self.max_hist
-        new_ds.max_total_len = self.max_total_len
-        return new_ds
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        hist_sids = row["hist_sids"]
-        chosen_sid = row["chosen_sid"]
-
-        hist_text = build_history_text(hist_sids, max_hist=self.max_hist)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": hist_text},
-        ]
-        prompt_with_begin = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        ) + "<|sid_begin|>"
-
-        chosen_text = prompt_with_begin + sid_to_core_text(chosen_sid)
-        prompt_ids = self.tokenizer(prompt_with_begin,
-                                    add_special_tokens=True)["input_ids"]
-        chosen_ids = self.tokenizer(chosen_text,
-                                    add_special_tokens=True)["input_ids"]
-        prompt_len = len(prompt_ids)
-
-        assert len(chosen_ids) == prompt_len + 3, (
-            f"chosen tokens != prompt+3: {len(chosen_ids)} vs {prompt_len + 3}"
-        )
-
-        if self.max_total_len is not None and len(chosen_ids) > self.max_total_len:
-            cut = len(chosen_ids) - self.max_total_len
-            chosen_ids = chosen_ids[cut:]
-            prompt_len = prompt_len - cut
-
-        return {
-            "chosen_input_ids": torch.tensor(chosen_ids, dtype=torch.long),
-            "prompt_len": prompt_len,
-        }
-
-
-def sft_collate(batch, pad_token_id):
-    B = len(batch)
-    seqs = [b["chosen_input_ids"] for b in batch]
-    prompt_lens = torch.tensor([b["prompt_len"] for b in batch], dtype=torch.long)
-    max_len = max(s.size(0) for s in seqs)
-    input_ids = torch.full((B, max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((B, max_len), dtype=torch.long)
-    for i, s in enumerate(seqs):
-        input_ids[i, :s.size(0)] = s
-        attention_mask[i, :s.size(0)] = 1
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "prompt_lens": prompt_lens,
-    }
+# Dataset (ChosenSIDDataset) and collate (chosen_collate) are imported from
+# dataset.py — same v1_grpo prompt construction as the DPO/ORPO trainers,
+# only the rejected column is ignored.
 
 
 # ===========================================================================
@@ -457,28 +351,26 @@ def main():
     model.enable_input_require_grads()
 
     print(f"Loading datasets (chosen-only view of v1_grpo) ...")
-    train_set = SFTChosenDataset(
+    train_set = ChosenSIDDataset(
         args.train_parquet, tokenizer,
+        G_per_group=args.G,
         max_hist=args.max_hist, max_total_len=args.max_total_len,
     )
-    valid_set = SFTChosenDataset(
+    valid_set = ChosenSIDDataset(
         args.valid_parquet, tokenizer,
+        G_per_group=args.G,
         max_hist=args.max_hist, max_total_len=args.max_total_len,
     )
-    train_full_groups = len(train_set) // args.G
-    valid_full_groups = len(valid_set) // args.G
+    train_full_groups = train_set.num_groups
+    valid_full_groups = valid_set.num_groups
 
     if args.max_train_groups > 0:
-        train_set = train_set.subsample_groups(
-            args.max_train_groups, args.G, seed=12345,
-        )
+        train_set = train_set.subsample_groups(args.max_train_groups, seed=12345)
     if args.max_eval_groups > 0:
-        valid_set = valid_set.subsample_groups(
-            args.max_eval_groups, args.G, seed=67890,
-        )
+        valid_set = valid_set.subsample_groups(args.max_eval_groups, seed=67890)
 
-    train_groups = len(train_set) // args.G
-    valid_groups = len(valid_set) // args.G
+    train_groups = train_set.num_groups
+    valid_groups = valid_set.num_groups
 
     # Auto-schedule N evenly-spaced checkpoints if requested.
     if args.num_checkpoints > 0:
@@ -503,7 +395,7 @@ def main():
     print(f"  valid: {valid_groups:,}/{valid_full_groups:,} groups  "
           f"({len(valid_set):,} chosen examples)")
 
-    collate = partial(sft_collate, pad_token_id=tokenizer.pad_token_id)
+    collate = partial(chosen_collate, pad_token_id=tokenizer.pad_token_id)
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),

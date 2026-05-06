@@ -20,7 +20,12 @@
 #   capacity. So we use the same SFT-arm hyperparameters and add ORPO's
 #   one new knob:
 #
-#     lambda_or = 0.1   (paper default; explores 0.1–1.0 in their Table 4)
+#     lambda_or = 0.3
+#       Paper's Table 4 default is 0.1 under the *sum*-log-p convention
+#       (log P(y|x) = sum over tokens). This repo scores SIDs with the
+#       *mean*-log-p convention for parity with all other trainers, which
+#       scales the OR-term gradient by 1/3 vs the paper. 0.3 here ≈ paper's
+#       0.1 in equivalent gradient strength.
 #
 # Hardware target: 1× A100 80GB (Ubuntu 22, CUDA 12). No ref model means
 # peak VRAM is ~30–40 GB at batch=24, leaving plenty of headroom — we
@@ -69,7 +74,7 @@ EVAL_CSV="runs/eval_engaged_orpo_5k_n1000.csv"
 mkdir -p "$EVAL_DIR"
 
 EVAL_N=1000
-LAMBDA_OR=0.1
+LAMBDA_OR=0.3
 
 START=$(date +%s)
 
@@ -95,7 +100,7 @@ else
     echo "============================================================"
     echo ">>> STEP 1/2: ORPO train  (5,000 groups, ~1.5 h)"
     echo ">>> lr=5e-5, lora_r=16/alpha=32, batch=24, 1 epoch"
-    echo ">>> lambda_or=$LAMBDA_OR  (paper default; OR-term weight)"
+    echo ">>> lambda_or=$LAMBDA_OR  (≈ paper's 0.1 under sum-log-p; we use mean-log-p so ×3)"
     echo ">>> nll_loss_scale=1.0    (paper formulation; not match_dpo)"
     echo ">>> from base (single stage, no SFT init, no ref model)"
     echo ">>> out: $RUN"
@@ -174,27 +179,33 @@ echo "    SFT-only 5k final    = -4.841"
 echo "    SFT-only 5k chosen_recall@96 (n=1000) = 0.0097"
 echo "============================================================"
 
+# HF Trainer's per-step eval prints `'eval_chosen_score': -4.84` (single-quoted
+# key, unquoted float). The final json.dumps prints `"eval_chosen_score": -4.84`
+# (double-quoted key, unquoted float). The regex below accepts either quote
+# style around the key, and either no quotes / single / double around the value.
 if [ -f "$TRAIN_LOG" ]; then
-    mapfile -t SCORES < <(
-        sed -nE "s/.*'eval_chosen_score': '([-+0-9.eE]+)'.*/\1/p" "$TRAIN_LOG"
-    )
+    extract_metric() {
+        local key="$1"
+        sed -nE "s/.*[\"']${key}[\"']: [\"']?([-+0-9.eE]+)[\"']?.*/\1/p" "$TRAIN_LOG"
+    }
+
+    mapfile -t SCORES < <(extract_metric eval_chosen_score)
+    mapfile -t PREF < <(extract_metric eval_pref_acc)
+    mapfile -t MARGIN < <(extract_metric eval_margin)
+    mapfile -t LOG_ODDS_M < <(extract_metric eval_log_odds_margin)
     LABELS=("ckpt 1 (step 125)" "ckpt 2 (step 250)" "ckpt 3 (step 375)" \
             "ckpt 4 (step 500)" "ckpt 5 (step 625)" "final (best ckpt)")
     for ((i=0; i<${#SCORES[@]} && i<6; i++)); do
         echo "    ${LABELS[$i]}: eval_chosen_score = ${SCORES[$i]}"
     done
-
-    # Also surface OR-term diagnostics: pref_acc + log_odds_margin
-    echo ""
-    mapfile -t PREF < <(
-        sed -nE "s/.*'eval_pref_acc': '([-+0-9.eE]+)'.*/\1/p" "$TRAIN_LOG"
-    )
-    mapfile -t MARGIN < <(
-        sed -nE "s/.*'eval_margin': '([-+0-9.eE]+)'.*/\1/p" "$TRAIN_LOG"
-    )
-    for ((i=0; i<${#PREF[@]} && i<6; i++)); do
-        echo "    ${LABELS[$i]}: pref_acc=${PREF[$i]}  margin=${MARGIN[$i]}"
-    done
+    if [ ${#PREF[@]} -gt 0 ]; then
+        echo ""
+        echo "    OR-term diagnostics (linear margin = chosen-rejected score gap;"
+        echo "    log_odds_margin = what L_OR optimizes — sigmoid input):"
+        for ((i=0; i<${#PREF[@]} && i<6; i++)); do
+            echo "    ${LABELS[$i]}: pref_acc=${PREF[$i]}  margin=${MARGIN[$i]}  log_odds=${LOG_ODDS_M[$i]:-n/a}"
+        done
+    fi
 fi
 
 # Headline engagement-aware metrics
@@ -224,7 +235,7 @@ echo "  → Next: still consider 50k ORPO if you want to test if ORPO scales"
 echo "    BETTER than SFT-only with more data."
 echo ""
 echo "If chosen_score > -4.84 (worse than SFT-only):"
-echo "  → OR term is harming chosen log-prob. Try lambda_or=0.05 or"
+echo "  → OR term is harming chosen log-prob. Try lambda_or=0.1 or"
 echo "    nll_loss_scale=2.0 to up-weight the SFT term."
 echo ""
 echo "For richer trend across the 5 ckpts (~15 min, no beam search):"

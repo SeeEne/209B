@@ -67,11 +67,10 @@ import warnings
 from functools import partial
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -81,7 +80,7 @@ from transformers import (
 )
 from transformers.utils import logging as hf_logging
 
-from dataset import SYSTEM_PROMPT, build_history_text, sid_to_core_text
+from dataset import PairedSIDDataset, paired_collate
 from utils import resolve_template
 
 
@@ -106,123 +105,6 @@ class TimingCallback(TrainerCallback):
             logs["sec/step"] = f"{(now - self.last_log_time) / steps_since:.2f}"
         self.last_log_time = now
         self.last_log_step = state.global_step
-
-
-# ===========================================================================
-# Dataset — chosen + rejected pairs from v1_grpo
-# ===========================================================================
-
-
-class ORPOPairDataset(Dataset):
-    """v1_grpo per-pair view: yields (history, chosen_sid, rejected_sid).
-
-    Sorted by (group_id, g) so subsample_groups can rely on "every G=3
-    consecutive rows = one group_id" — same convention as the SFT and DPO
-    trainers, which lets all three reuse the same 5k user subset given the
-    same subsample_seed.
-    """
-
-    def __init__(self, parquet_path, tokenizer, G_per_group=3,
-                 max_hist=512, max_total_len=3072):
-        df = pd.read_parquet(parquet_path)
-        if "group_id" in df.columns and "g" in df.columns:
-            df = df.sort_values(["group_id", "g"])
-        self.df = df.reset_index(drop=True)
-        assert len(self.df) % G_per_group == 0, (
-            f"len={len(self.df)} not divisible by G={G_per_group}"
-        )
-        self.tokenizer = tokenizer
-        self.G_per_group = G_per_group
-        self.max_hist = max_hist
-        self.max_total_len = max_total_len
-
-    def __len__(self):
-        return len(self.df)
-
-    @property
-    def num_groups(self):
-        return len(self.df) // self.G_per_group
-
-    def subsample_groups(self, n_groups, seed):
-        if n_groups >= self.num_groups:
-            return self
-        rng = torch.Generator().manual_seed(seed)
-        all_groups = torch.randperm(self.num_groups, generator=rng).tolist()
-        chosen = sorted(all_groups[:n_groups])
-        keep_indices = []
-        for gid in chosen:
-            for g in range(self.G_per_group):
-                keep_indices.append(gid * self.G_per_group + g)
-        new_df = self.df.iloc[keep_indices].reset_index(drop=True)
-        new_ds = object.__new__(ORPOPairDataset)
-        new_ds.df = new_df
-        new_ds.tokenizer = self.tokenizer
-        new_ds.G_per_group = self.G_per_group
-        new_ds.max_hist = self.max_hist
-        new_ds.max_total_len = self.max_total_len
-        return new_ds
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        hist_sids = row["hist_sids"]
-        chosen_sid = row["chosen_sid"]
-        rejected_sid = row["rejected_sid"]
-
-        hist_text = build_history_text(hist_sids, max_hist=self.max_hist)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": hist_text},
-        ]
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        ) + "<|sid_begin|>"
-
-        chosen_text = prompt + sid_to_core_text(chosen_sid)
-        rejected_text = prompt + sid_to_core_text(rejected_sid)
-
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
-        chosen_ids = self.tokenizer(chosen_text,
-                                    add_special_tokens=True)["input_ids"]
-        rejected_ids = self.tokenizer(rejected_text,
-                                      add_special_tokens=True)["input_ids"]
-        prompt_len = len(prompt_ids)
-
-        assert len(chosen_ids) == prompt_len + 3
-        assert len(rejected_ids) == prompt_len + 3
-
-        if self.max_total_len is not None and len(chosen_ids) > self.max_total_len:
-            cut = len(chosen_ids) - self.max_total_len
-            chosen_ids = chosen_ids[cut:]
-            rejected_ids = rejected_ids[cut:]
-            prompt_len = prompt_len - cut
-
-        return {
-            "chosen_input_ids": torch.tensor(chosen_ids, dtype=torch.long),
-            "rejected_input_ids": torch.tensor(rejected_ids, dtype=torch.long),
-            "prompt_len": prompt_len,
-        }
-
-
-def orpo_collate(batch, pad_token_id):
-    """Pack chosen + rejected into a (2B, L) tensor; first B = chosen."""
-    B = len(batch)
-    chosen = [b["chosen_input_ids"] for b in batch]
-    rejected = [b["rejected_input_ids"] for b in batch]
-    prompt_lens = torch.tensor([b["prompt_len"] for b in batch], dtype=torch.long)
-
-    all_seqs = chosen + rejected
-    max_len = max(s.size(0) for s in all_seqs)
-    input_ids = torch.full((2 * B, max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((2 * B, max_len), dtype=torch.long)
-    for i, s in enumerate(all_seqs):
-        input_ids[i, :s.size(0)] = s
-        attention_mask[i, :s.size(0)] = 1
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "prompt_lens": prompt_lens,  # length B (shared by chosen+rejected halves)
-    }
 
 
 # ===========================================================================
@@ -333,6 +215,10 @@ class ORPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False,
                      num_items_in_batch=None):
         prompt_lens = inputs.pop("prompt_lens")
+        # PairedSIDDataset always emits group_id and the shared paired_collate
+        # forwards group_ids; ORPO doesn't consume groups but pop here so
+        # nothing extra travels into the transformer call.
+        group_ids = inputs.pop("group_ids", None)
 
         causal_lm = (
             model.get_base_model() if hasattr(model, "get_base_model") else model
@@ -357,6 +243,8 @@ class ORPOTrainer(Trainer):
 
         # Re-attach for prediction_step.
         inputs["prompt_lens"] = prompt_lens
+        if group_ids is not None:
+            inputs["group_ids"] = group_ids
 
         if return_outputs:
             scores = torch.stack([chosen_score, rejected_score], dim=-1)
@@ -388,21 +276,43 @@ class ORPOTrainer(Trainer):
         return (loss.detach(), extras["scores"].detach(), labels)
 
 
+_LOG_HALF_NP = math.log(0.5)
+
+
+def _log1mexp_np(x: np.ndarray, log_clamp: float = -1e-6) -> np.ndarray:
+    """Numpy port of log1mexp for compute_metrics. Same Mächler 2012 split as
+    the torch version above; ``log_clamp`` keeps log_odds finite at P→1."""
+    x = np.minimum(x, log_clamp)
+    return np.where(
+        x > _LOG_HALF_NP,
+        np.log(-np.expm1(x)),
+        np.log1p(-np.exp(x)),
+    )
+
+
 def compute_metrics(eval_pred):
+    """Returns chosen / rejected absolute log-prob, the linear margin,
+    pref_acc, AND ``log_odds_margin`` (= what L_OR actually optimizes).
+
+    log_odds_margin is the ORPO-specific signal: pref_acc and linear margin
+    can climb while log_odds_margin saturates, because log_odds compresses
+    near P→1. Worth tracking separately when interpreting OR-term behavior.
+    """
     scores = eval_pred.predictions
     if isinstance(scores, tuple):
         scores = scores[0]
-    chosen = scores[:, 0]
-    rejected = scores[:, 1]
-    pref_acc = float((chosen > rejected).mean())
-    margin = float((chosen - rejected).mean())
-    chosen_score = float(chosen.mean())
-    rejected_score = float(rejected.mean())
+    chosen = scores[:, 0].astype(np.float64)
+    rejected = scores[:, 1].astype(np.float64)
+
+    log_odds_c = chosen - _log1mexp_np(chosen)
+    log_odds_r = rejected - _log1mexp_np(rejected)
+
     return {
-        "chosen_score": chosen_score,
-        "rejected_score": rejected_score,
-        "margin": margin,
-        "pref_acc": pref_acc,
+        "chosen_score": float(chosen.mean()),
+        "rejected_score": float(rejected.mean()),
+        "margin": float((chosen - rejected).mean()),
+        "pref_acc": float((chosen > rejected).mean()),
+        "log_odds_margin": float((log_odds_c - log_odds_r).mean()),
     }
 
 
@@ -444,10 +354,15 @@ def main():
 
     # ORPO
     parser.add_argument(
-        "--lambda_or", type=float, default=0.1,
-        help="Weight on the odds-ratio term. Paper default 0.1 (Hong et al. "
-             "2024). Range explored in their paper: 0.1–1.0. Larger = more "
-             "discriminative pressure, smaller = closer to pure SFT.",
+        "--lambda_or", type=float, default=0.3,
+        help="Weight on the odds-ratio term. Paper default is 0.1 under the "
+             "*sum*-log-p convention (log P(y|x) = sum over tokens). This repo "
+             "scores SIDs with the *mean*-log-p convention (chosen_score = "
+             "(1/3) * sum log p_t) for consistency with all other trainers, "
+             "which scales the OR-term gradient by 1/3 vs the paper. Default "
+             "0.3 here ≈ paper's 0.1 in equivalent gradient strength. Drop to "
+             "0.1 for a literal-paper recipe; raise to 1.0 for stronger "
+             "discriminative pressure.",
     )
     parser.add_argument(
         "--nll_loss_scale", type=float, default=1.0,
@@ -556,14 +471,17 @@ def main():
     model.enable_input_require_grads()
 
     print(f"Loading datasets (G={args.G}) ...")
-    train_set = ORPOPairDataset(args.train_parquet, tokenizer,
-                                G_per_group=args.G,
-                                max_hist=args.max_hist,
-                                max_total_len=args.max_total_len)
-    valid_set = ORPOPairDataset(args.valid_parquet, tokenizer,
-                                G_per_group=args.G,
-                                max_hist=args.max_hist,
-                                max_total_len=args.max_total_len)
+    # PairedSIDDataset is shared across DPO joint / DPO-from-SFT / ORPO. ORPO
+    # ignores the forwarded group_id (paired_collate emits it; ORPOTrainer pops
+    # and discards) — kept as one impl so a fix lands once for every trainer.
+    train_set = PairedSIDDataset(args.train_parquet, tokenizer,
+                                 G_per_group=args.G,
+                                 max_hist=args.max_hist,
+                                 max_total_len=args.max_total_len)
+    valid_set = PairedSIDDataset(args.valid_parquet, tokenizer,
+                                 G_per_group=args.G,
+                                 max_hist=args.max_hist,
+                                 max_total_len=args.max_total_len)
     train_full = train_set.num_groups
     valid_full = valid_set.num_groups
     if args.max_train_groups > 0:
@@ -596,7 +514,7 @@ def main():
     print(f"  valid: {valid_set.num_groups:,}/{valid_full:,} groups "
           f"({len(valid_set):,} pairs)")
 
-    collate = partial(orpo_collate, pad_token_id=tokenizer.pad_token_id)
+    collate = partial(paired_collate, pad_token_id=tokenizer.pad_token_id)
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),

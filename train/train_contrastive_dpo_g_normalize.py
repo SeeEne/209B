@@ -56,11 +56,10 @@ import warnings
 from functools import partial
 from pathlib import Path
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -71,7 +70,7 @@ from transformers import (
 )
 from transformers.utils import logging as hf_logging
 
-from dataset import SYSTEM_PROMPT, build_history_text, sid_to_core_text
+from dataset import GroupedSampler, PairedSIDDataset, paired_collate
 from utils import resolve_template
 
 # Default group size — overridable via --G. Must match the build_contrastive_
@@ -107,191 +106,8 @@ class TimingCallback(TrainerCallback):
         self.last_log_step = state.global_step
 
 
-# ===========================================================================
-# Dataset (same as train_contrastive_grpo.py)
-# ===========================================================================
-
-
-class ContrastiveDatasetGRPO(Dataset):
-    """
-    Each row = one (chosen, rejected) pair with single SID per side.
-    Rows are kept sorted by (group_id, g) so that any G_per_group consecutive
-    rows are exactly one group — required by GroupedSampler.
-    """
-
-    def __init__(self, parquet_path, tokenizer, G_per_group=DEFAULT_G,
-                 max_hist=512, max_total_len=3072):
-        df = pd.read_parquet(parquet_path)
-        df = df.sort_values(["group_id", "g"]).reset_index(drop=True)
-        assert len(df) % G_per_group == 0, (
-            f"len={len(df)} not divisible by G={G_per_group}; "
-            f"dataset / G mismatch"
-        )
-        for i in range(min(3, len(df) // G_per_group)):
-            block = df.iloc[i * G_per_group:(i + 1) * G_per_group]
-            assert block["group_id"].nunique() == 1
-            assert sorted(block["g"].tolist()) == list(range(G_per_group))
-
-        self.df = df
-        self.tokenizer = tokenizer
-        self.G_per_group = G_per_group
-        self.max_hist = max_hist
-        self.max_total_len = max_total_len
-        # Optional cache from precompute_ref_scores(): (N, 2) fp32 CPU tensor
-        # of [ref_chosen_score, ref_rejected_score] per pair. When set, the
-        # trainer will skip the per-step ref forward and use these instead.
-        self.ref_scores = None
-
-    def __len__(self):
-        return len(self.df)
-
-    @property
-    def num_groups(self):
-        return len(self.df) // self.G_per_group
-
-    def subsample_groups(self, n_groups, seed):
-        if n_groups >= self.num_groups:
-            return self
-        rng = torch.Generator().manual_seed(seed)
-        all_groups = torch.randperm(self.num_groups, generator=rng).tolist()
-        chosen = sorted(all_groups[:n_groups])
-        keep_indices = []
-        for gid in chosen:
-            for g in range(self.G_per_group):
-                keep_indices.append(gid * self.G_per_group + g)
-        new_df = self.df.iloc[keep_indices].reset_index(drop=True)
-
-        new_ds = object.__new__(ContrastiveDatasetGRPO)
-        new_ds.df = new_df
-        new_ds.tokenizer = self.tokenizer
-        new_ds.G_per_group = self.G_per_group
-        new_ds.max_hist = self.max_hist
-        new_ds.max_total_len = self.max_total_len
-        # ref_scores can't carry through subsample (indices change). Always
-        # subsample BEFORE precompute_ref_scores.
-        new_ds.ref_scores = None
-        return new_ds
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        hist_sids = row["hist_sids"]
-        chosen_sid = row["chosen_sid"]
-        rejected_sid = row["rejected_sid"]
-        group_id = int(row["group_id"])
-
-        hist_text = build_history_text(hist_sids, max_hist=self.max_hist)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": hist_text},
-        ]
-        prompt_with_begin = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        ) + "<|sid_begin|>"
-
-        chosen_text = prompt_with_begin + sid_to_core_text(chosen_sid)
-        rejected_text = prompt_with_begin + sid_to_core_text(rejected_sid)
-
-        prompt_ids = self.tokenizer(prompt_with_begin, add_special_tokens=True)["input_ids"]
-        chosen_ids = self.tokenizer(chosen_text, add_special_tokens=True)["input_ids"]
-        rejected_ids = self.tokenizer(rejected_text, add_special_tokens=True)["input_ids"]
-        prompt_len = len(prompt_ids)
-
-        assert len(chosen_ids) == prompt_len + 3, (
-            f"chosen tokens != prompt+3: {len(chosen_ids)} vs {prompt_len + 3}"
-        )
-        assert len(rejected_ids) == prompt_len + 3, (
-            f"rejected tokens != prompt+3: {len(rejected_ids)} vs {prompt_len + 3}"
-        )
-
-        if self.max_total_len is not None and len(chosen_ids) > self.max_total_len:
-            cut = len(chosen_ids) - self.max_total_len
-            chosen_ids = chosen_ids[cut:]
-            rejected_ids = rejected_ids[cut:]
-            prompt_len = prompt_len - cut
-
-        item = {
-            "chosen_input_ids": torch.tensor(chosen_ids, dtype=torch.long),
-            "rejected_input_ids": torch.tensor(rejected_ids, dtype=torch.long),
-            "prompt_len": prompt_len,
-            "group_id": group_id,
-        }
-        if self.ref_scores is not None:
-            item["ref_chosen_score"] = float(self.ref_scores[idx, 0].item())
-            item["ref_rejected_score"] = float(self.ref_scores[idx, 1].item())
-        return item
-
-
-# ===========================================================================
-# Collate (unchanged from train_contrastive_grpo.py)
-# ===========================================================================
-
-
-def grpo_collate(batch, pad_token_id):
-    B = len(batch)
-    chosen = [b["chosen_input_ids"] for b in batch]
-    rejected = [b["rejected_input_ids"] for b in batch]
-    prompt_lens = torch.tensor([b["prompt_len"] for b in batch], dtype=torch.long)
-    group_ids = torch.tensor([b["group_id"] for b in batch], dtype=torch.long)
-
-    all_seqs = chosen + rejected
-    max_len = max(s.size(0) for s in all_seqs)
-    input_ids = torch.full((2 * B, max_len), pad_token_id, dtype=torch.long)
-    attention_mask = torch.zeros((2 * B, max_len), dtype=torch.long)
-    for i, s in enumerate(all_seqs):
-        input_ids[i, :s.size(0)] = s
-        attention_mask[i, :s.size(0)] = 1
-
-    out = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "prompt_lens": prompt_lens,
-        "group_ids": group_ids,
-    }
-    # Forward cached ref scores if dataset attached them. Trainer will
-    # use these and skip the per-step ref forward.
-    if "ref_chosen_score" in batch[0]:
-        out["ref_chosen_scores"] = torch.tensor(
-            [b["ref_chosen_score"] for b in batch], dtype=torch.float32
-        )
-        out["ref_rejected_scores"] = torch.tensor(
-            [b["ref_rejected_score"] for b in batch], dtype=torch.float32
-        )
-    return out
-
-
-# ===========================================================================
-# Sampler (unchanged from train_contrastive_grpo.py)
-# ===========================================================================
-
-
-class GroupedSampler(Sampler):
-    def __init__(self, num_samples, G_per_group=3, shuffle=True, seed=42):
-        assert num_samples % G_per_group == 0, (
-            f"num_samples={num_samples} must be divisible by G={G_per_group}"
-        )
-        self.num_samples = num_samples
-        self.G = G_per_group
-        self.num_groups = num_samples // G_per_group
-        self.shuffle = shuffle
-        self.seed = seed
-        self.epoch = 0
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-    def __iter__(self):
-        if self.shuffle:
-            gen = torch.Generator()
-            gen.manual_seed(self.seed + self.epoch)
-            order = torch.randperm(self.num_groups, generator=gen).tolist()
-        else:
-            order = list(range(self.num_groups))
-        for gid in order:
-            for g in range(self.G):
-                yield gid * self.G + g
-
-    def __len__(self):
-        return self.num_samples
+# Dataset (PairedSIDDataset), collate (paired_collate) and GroupedSampler are
+# imported from dataset.py — shared with train_dpo_from_sft.py and train_orpo.py.
 
 
 # ===========================================================================
@@ -437,7 +253,7 @@ def precompute_ref_scores(ref_model, dataset, pad_token_id, batch_size,
     Saves one ref forward per training step downstream — ref_model can be
     freed after this call when kl_weight == 0.
     """
-    collate = partial(grpo_collate, pad_token_id=pad_token_id)
+    collate = partial(paired_collate, pad_token_id=pad_token_id)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=0, collate_fn=collate, drop_last=False,
@@ -959,12 +775,12 @@ def main():
     model.enable_input_require_grads()
 
     print(f"Loading datasets (G={args.G}) ...")
-    train_set = ContrastiveDatasetGRPO(
+    train_set = PairedSIDDataset(
         args.train_parquet, tokenizer,
         G_per_group=args.G,
         max_hist=args.max_hist, max_total_len=args.max_total_len,
     )
-    valid_set = ContrastiveDatasetGRPO(
+    valid_set = PairedSIDDataset(
         args.valid_parquet, tokenizer,
         G_per_group=args.G,
         max_hist=args.max_hist, max_total_len=args.max_total_len,
@@ -1007,7 +823,7 @@ def main():
     print(f"  valid: {_fmt(valid_set.num_groups, valid_full_groups)} groups  "
           f"({len(valid_set):,} pairs)")
 
-    collate = partial(grpo_collate, pad_token_id=tokenizer.pad_token_id)
+    collate = partial(paired_collate, pad_token_id=tokenizer.pad_token_id)
 
     training_args = TrainingArguments(
         output_dir=str(out_dir),
