@@ -39,3 +39,10 @@ build/
 dist/
 
 model/*
+
+runs/*
+
+!runs/**/*.txt
+!runs/**/*.csv
+
+!runs/**/
