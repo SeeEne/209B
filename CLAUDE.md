@@ -175,16 +175,20 @@ project/
 - DPO+SFT joint 5k: Δ improves but eval_pref_acc only 0.546 (sft_scale_mode match_dpo overpowers DPO discriminative signal)
 - SFT-only 5k sweep: lr ∈ {5e-5, 2e-4, 5e-4} all converge to chosen_score ≈ −4.84; LoRA r=16 → 32 changes chosen by 0.002 nats (noise) → **5k ceiling = data, not optimization**
 - **ORPO 5k (2026-05-07, λ=0.1, lr=5e-5)**: chosen=0.0107, rejected=0.0123, Δrecall=−0.0017, Δpass=−0.0060. **Best 5k single-stage arm.** chosen_score saturates at −4.840 (≈ SFT-only −4.841) but engagement-aware recall_chosen is 10% higher than SFT-only → OR term reshapes the distribution at chosen-relevant tokens even when the absolute mean log-prob doesn't move. pref_acc plateaued at 0.535 (climbed monotonically 0.528 → 0.535 across 5 ckpts) — OR-term gradient signal weak at λ=0.1 over 1 epoch on 5k pairs. Wall clock 5.5 h on A100 80GB / SDPA. See `archive/EXPERIMENTS.md` for trajectory.
+- **SFT-only 50k (2026-05-07, lr=5e-5, lora_r=16)**: **broke the 5k ceiling.** chosen_score −4.795 (improved 0.046 nats vs 5k's −4.841; 0.125 nats total vs base −4.92). Eval trend monotonically descending across all 5 ckpts: −4.831 → −4.818 → −4.805 → −4.799 → −4.795, slope decaying late (saturation onset). Engagement-aware n=5000: **chosen=0.0140 (+50% vs base 0.0093, t≈4.7), rejected=0.0132, Δrecall=+0.0008, pass@96 chosen=0.0404 (+62% vs base ~0.025), Δpass=+0.0052.** First arm to (a) lift chosen recall above baseline in absolute terms, (b) flip Δrecall sign, (c) push Δpass clearly positive. Δrecall on its own is t≈0.6 (not p<0.05 alone), but the chosen-recall increase vs baseline IS statistically robust, and the trend across 0/5k/50k is monotonic on every metric. **Validates the data-bottleneck hypothesis from the 5k sweeps**: the −4.84 ceiling was the data, not the optimization. Wall clock 17.4 h on RTX 6000 Pro.
 
 **In-flight (2026-05-07):**
-- ORPO 50k (`scripts/run_orpo_50k.sh`, ~38 h on A100 80GB / SDPA) — direct scale-up of the 5k smoke; same hyperparameters. Tests whether 10× data lifts chosen_score above the SFT ceiling and pushes Δrecall to zero or positive.
-- 50k SFT (`scripts/run_sft_50k.sh`, ~17 h on RTX 6000 Pro / H100) — testing whether 10× data breaks the −4.84 ceiling for the SFT-only arm.
+- ORPO 50k (`scripts/run_orpo_50k.sh`, ~38 h on A100 80GB / SDPA, **server B**) — direct scale-up of the 5k ORPO smoke; same hyperparameters. Tests whether 10× data lifts chosen_score above SFT-50k's −4.795 and pushes Δrecall further positive than +0.0008.
+- DPO+light-anchor from SFT-50k (`scripts/run_dpo_anchor_from_sft_50k.sh`, ~38 h on RTX 6000 Pro / H100, **server A**) — Stage 2 of the sequential pipeline. Loss = `L_dpo_grpo + 0.15 × L_sft_raw` (raw mode, ~19% SFT contribution post-warmup). Light anchor protects against the 5k SFT→DPO collapse mode while letting DPO push rejected log-prob down. Starting point: SFT-50k's chosen=0.0140, rejected=0.0132. Goal: keep chosen ≥ 0.0140 AND drive rejected below 0.0132 → flip Δrecall solidly positive.
+
+**Final comparison shape (post 2026-05-09):**
+The headline ablation is **ORPO 50k vs (SFT-50k → DPO+anchor 50k)** — single-stage no-ref vs two-stage with-ref, evaluated by the same engagement-aware metric on n=5000. SFT-50k itself remains in the table as the strongest single-objective baseline.
 
 **Decision logic for next steps:**
-1. ORPO 50k breaks ceiling AND Δrecall ≥ 0 → headline result for the report; final ablation row.
-2. ORPO 50k breaks ceiling but Δrecall stays negative → λ ablation at 50k (try paper's Phi-2 setting λ=0.25).
-3. SFT-50k breaks ceiling → run Stage 2 DPO from SFT-50k for full sequential pipeline.
-4. All arms stay at ≈ −4.84 → reconsider OneRec base or eval methodology.
+1. Both 50k arms beat SFT-50k chosen_recall AND ORPO 50k > sequential → headline = ORPO (simpler, no ref).
+2. Both beat SFT-50k AND sequential > ORPO → headline = sequential (validates the SFT→DPO recipe).
+3. Either arm crashes chosen_recall below SFT-50k → tune that arm's only knob (λ for ORPO, sft_weight for anchor) before declaring failure.
+4. Neither arm meaningfully beats SFT-50k → headline = SFT-50k itself (already a defensible positive result; the project finding stands).
 
 ## Dependencies
 
@@ -382,4 +386,5 @@ This cache is the reason hyperparameter sweeps are fast — keep it in mind when
   - `--dpo_beta 0.1` — standard DPO scaling (DeepSeek/Llama-3 use this)
   - `--sft_weight 1.0 --sft_scale_mode match_dpo` — anchor on chosen, rescaled to match `L_dpo_grpo` magnitude. Raise if chosen recall drops; lower if Δ shrinks because SFT dominates. (Without `match_dpo`, you'd want ~10–30 to get the same effect — the old `0.1` was effectively ~1–3%.)
   - `--kl_weight 0` — explicit KL is **off** by default; DPO has implicit KL via ref baseline
-- **ORPO is a parallel arm, not a replacement.** The DPO+SFT joint trainer remains the primary path; ORPO is run on a separate server to test whether dropping the ref model and merging stages costs anything in this offline behavior-signal regime. They are evaluated by the SAME engagement-aware metric, so results go side-by-side in the final ablation table.
+- **Final headline contenders: ORPO 50k vs (SFT-50k → DPO+anchor 50k).** As of 2026-05-07 these are the two arms left to settle the project's recommendation. The SFT-only 50k arm broke the 5k ceiling and produced a defensible positive result on its own (chosen +50% vs base, Δrecall flipped to +0.0008), so even if both 50k contenders fail to improve further, the project finding stands. The DPO+SFT joint trainer (`train_contrastive_dpo_g_normalize.py`) is no longer the primary path — its 5k smoke had eval_pref_acc ≈ 0.546 (random) due to SFT dominating gradients via match_dpo. The sequential pipeline addresses that by giving each stage 100% of its gradient on a single objective; the joint trainer is reused here only because it's the only one with a configurable SFT-anchor knob, set to a deliberately low `sft_weight=0.15 raw` for Stage 2.
+- **All arms evaluated by the SAME engagement-aware metric** (`evaluate_engaged.py` on `contrastive_dataset_v1/valid.parquet`, n=5000 for headline numbers, n=1000 for fast iteration). Results go side-by-side in the final ablation table.
