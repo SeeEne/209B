@@ -82,6 +82,12 @@ unset HF_HUB_OFFLINE
 unset TRANSFORMERS_OFFLINE
 export OMP_NUM_THREADS=8
 
+# Force python stdout/stderr to flush line-by-line so `tee` shows training
+# progress live in the terminal AND writes the same content to the .log
+# file. Without this, python uses BLOCK buffering when stdout is a pipe,
+# and the terminal sits idle for minutes between bursts.
+export PYTHONUNBUFFERED=1
+
 # ---- Paths ----
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -170,7 +176,7 @@ else
         --output_dir "$RUN" \
         --max_train_groups 5000 --max_eval_groups 1000 \
         --num_checkpoints 5 --logging_steps 25 \
-        --per_device_batch_size 48 --grad_accum 1 \
+        --per_device_batch_size 24 --grad_accum 1 \
         --lr 5e-5 \
         --lambda_or $LAMBDA_OR \
         --nll_loss_scale 1.0 \
