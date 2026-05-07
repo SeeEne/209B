@@ -63,6 +63,9 @@ set -o pipefail
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export OMP_NUM_THREADS=8
+# Force unbuffered Python stdout/stderr so `tee` sees output line-by-line
+# instead of in big chunks during this 38h run.
+export PYTHONUNBUFFERED=1
 
 # ---- Paths ----
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
