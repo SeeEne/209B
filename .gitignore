@@ -27,9 +27,13 @@ env/
 *.safetensors
 *.ckpt
 *.pt
-models/
+model/      # singular — the path actually used in this project (model/OneRec-1.7B/, etc.)
+models/     # plural — keep too in case
 checkpoints/
 
 runs/*
 
-onerec_209b.egg-info/*
+# pip install -e . artifacts (auto-generated, never check in).
+*.egg-info/
+build/
+dist/
