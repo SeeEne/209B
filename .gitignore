@@ -44,5 +44,3 @@ runs/*
 
 !runs/**/*.txt
 !runs/**/*.csv
-
-!runs/**/
