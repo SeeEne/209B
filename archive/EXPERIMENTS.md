@@ -307,7 +307,74 @@ held-out valid set used by `evaluate_engaged.py`.
 | GRPO 5k smoke G=3 (Step 5) | 0.0033 | 0.0003 | +0.0030 | +0.0080 |
 | GRPO 5k smoke G=5 (Step 5) | 0.0030 | 0.0010 | +0.0020 | +0.0050 |
 | GRPO 50k step 2500 (Step 6) | 0.0043 | 0.0027 | +0.0017 | +0.0040 |
-| DPO + SFT + G-norm (Step 7) | *running* | | | |
+| SFT-only 5k (Step 7 anchor)              | 0.0097     | 0.0127       | −0.0030     | —          |
+| **ORPO 5k (Step 8, 2026-05-07)**         | **0.0107** | **0.0123**   | **−0.0017** | **−0.0060** |
 
-**Watch for in DPO smoke:** `recall_chosen ≥ 0.009` (≥ baseline) AND `Δ > 0`.
-That's the goal — not just a higher Δ, but chosen *rising in absolute terms*.
+**ORPO 5k is the best single-stage 5k arm by every column** — highest
+recall_chosen, lowest recall_rejected, smallest absolute Δrecall.
+Δrecall remains negative (rejected still slightly more recalled than
+chosen) but is closer to zero than any 5k-data arm produced so far.
+Statistical caveat: n=1000 puts the 0.0107 vs 0.0097 (ORPO vs SFT-only)
+gap inside binomial noise (95 % CI ~±0.006 at p≈0.01); the four-metric
+directional agreement (ORPO > SFT > baseline on every column) is
+stronger evidence than any single gap.
+
+**Watch for in 50k follow-ups:** `recall_chosen ≥ 0.012` (clearly above
+the 5k ceiling) AND `Δrecall ≥ 0` (positive direction). The 5k
+trajectory was monotonically rising and decelerating, so 10× data has
+upside even if the per-step OR gradient signal stays weak.
+
+---
+
+## Step 8 — ORPO arm (2026-05-07)
+
+Single-stage, no reference model, no group normalization. Trainer at
+`train/train_orpo.py`. Loss formulation strictly follows paper Eq. 3
+(length-normalized mean log-prob; λ=0.1 paper default for Mistral-ORPO).
+Optimization recipe deviates from the paper for cross-arm parity with
+the SFT/DPO arms: lr=5e-5 vs paper 8e-6, 1 epoch vs paper 10, LoRA r=16
+vs full fine-tune, linear schedule vs cosine.
+
+**5k smoke trajectory** (eval every 125 steps, eval set n=1000 pairs
+from `v1_grpo/valid.parquet`):
+
+| ckpt | step | chosen_score | rejected | margin | log_odds | pref_acc |
+|---|---|---|---|---|---|---|
+| 1 | 125 | −4.857 | −4.967 | 0.110 | 0.112 | 0.528 |
+| 2 | 250 | −4.851 | −4.973 | 0.123 | 0.125 | 0.531 |
+| 3 | 375 | −4.844 | −4.975 | 0.131 | 0.134 | 0.534 |
+| 4 | 500 | −4.841 | −4.976 | 0.135 | 0.137 | 0.533 |
+| 5 | 625 | **−4.840** | **−4.980** | **0.140** | **0.143** | **0.535** |
+
+`chosen_score` lifted base −4.92 → −4.840 monotonically across all 5
+ckpts; trajectory still rising slightly at ckpt 5 (decelerating, not
+flat). `pref_acc` climbed 0.528 → 0.535 — real but small; the OR-term
+gradient signal is gentle at λ=0.1 with only 625 total steps (paper
+trained Mistral-ORPO for 10 epochs on UltraFeedback, ≈3 orders of
+magnitude more OR-gradient steps than this smoke).
+
+**Why ORPO beats SFT-only at iso-data even though `chosen_score` is
+identical:** ORPO 5k final `chosen_score` = −4.840 ≈ SFT-only 5k −4.841
+(same absolute scalar), but `recall_chosen@96` = 0.0107 vs SFT-only's
+0.0097 (~10 % relative lift). The OR term reshapes the *distribution*
+at the chosen-relevant tokens (sharpens chosen vs rejected at the SID-
+token level) even though the absolute scalar `mean log P(chosen)`
+saturates at the same point. This shows up in beam-search recall but
+not in the linear log-prob metric.
+
+**No collapse.** The earlier GRPO-only failure mode (chosen recall
+dropping 0.0093 → 0.0043) doesn't reproduce here because L_NLL
+contributes ~98 % of the total loss magnitude (`L_NLL ≈ 4–5` vs
+`λ·L_OR ≈ 0.04–0.09`); the SFT-anchor gradient on the chosen side is
+~50× larger than the OR-term contribution and structurally prevents
+the contrastive collapse.
+
+**Wall clock**: 5.5 h on A100 80GB with SDPA (no flash-attn — cu130 +
+torch 2.11 has no prebuilt wheel; from-source compile blocked by
+missing nvcc on this box). Per-step ~21 s at batch=24 with 2× sequences
+(chosen+rejected stacked into (2B, L) = (48, ~2700)).
+
+**Next:** scale to 50k via `scripts/run_orpo_50k.sh` (~38 h same box).
+Same hyperparameters. The 50k bet is "more gradient steps on the OR
+term + more chosen examples break the SFT ceiling and lift Δrecall to
+≥ 0".

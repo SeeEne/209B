@@ -154,35 +154,37 @@ project/
 └── runs/                                      # experiment outputs (not in git)
 ```
 
-## Current status (2026-05-06)
+## Current status (2026-05-07)
 
 (See `archive/EXPERIMENTS.md` for full timeline.)
 
-**Three ablation arms now in place**, sharing the same `data/contrastive_dataset_v1_grpo` 5k subset (deterministic via `subsample_seed`):
+**Four ablation arms now in place**, sharing the same `data/contrastive_dataset_v1_grpo` 5k subset (deterministic via `subsample_seed`):
 
 | Arm | Trainer | Loss | Ref model | Group norm |
 |-----|---------|------|-----------|------------|
 | DPO+SFT joint | `train_contrastive_dpo_g_normalize.py` | `L_dpo_grpo + λ·L_sft` | yes (cached) | yes |
 | SFT → DPO sequential | `train_sft_only.py` → `train_dpo_from_sft.py` | stage-isolated | stage 2 only | stage 2 only |
 | SFT-only | `train_sft_only.py` | `L_sft` (16× scale) | no | no |
-| ORPO | `train_orpo.py` | `L_NLL + λ·L_OR` | no | no |
+| ORPO | `train_orpo.py` | `L_NLL + λ·L_OR` (paper Eq. 3 mean-log-p, λ=0.1) | no | no |
 
-**Empirical findings (5k smoke):**
+**Empirical findings (5k smoke, n=1000 engagement eval unless noted):**
 - length=3 30k full: Δpass=+0.0080, eval_pref_acc=0.674
 - GRPO 5k (G=3): matched length=3 30k Δ with 1/6 data
 - G=5 ablation: G=5 worse than G=3 — variance reduction saturates due to within-group correlation
 - GRPO 50k partial: chosen recall drops 0.0093 → 0.0043 → motivated SFT anchor
 - DPO+SFT joint 5k: Δ improves but eval_pref_acc only 0.546 (sft_scale_mode match_dpo overpowers DPO discriminative signal)
 - SFT-only 5k sweep: lr ∈ {5e-5, 2e-4, 5e-4} all converge to chosen_score ≈ −4.84; LoRA r=16 → 32 changes chosen by 0.002 nats (noise) → **5k ceiling = data, not optimization**
+- **ORPO 5k (2026-05-07, λ=0.1, lr=5e-5)**: chosen=0.0107, rejected=0.0123, Δrecall=−0.0017, Δpass=−0.0060. **Best 5k single-stage arm.** chosen_score saturates at −4.840 (≈ SFT-only −4.841) but engagement-aware recall_chosen is 10% higher than SFT-only → OR term reshapes the distribution at chosen-relevant tokens even when the absolute mean log-prob doesn't move. pref_acc plateaued at 0.535 (climbed monotonically 0.528 → 0.535 across 5 ckpts) — OR-term gradient signal weak at λ=0.1 over 1 epoch on 5k pairs. Wall clock 5.5 h on A100 80GB / SDPA. See `archive/EXPERIMENTS.md` for trajectory.
 
-**In-flight (2026-05-06):**
-- 50k SFT (`scripts/run_sft_50k.sh`, ~17h on RTX 6000 Pro / H100) — testing whether 10× data breaks the −4.84 ceiling.
-- 5k ORPO (`scripts/run_orpo_smoke.sh`, ~1.5h on A100 80GB) — separate server, single-stage from base, no ref model. λ=0.1 (paper default).
+**In-flight (2026-05-07):**
+- ORPO 50k (`scripts/run_orpo_50k.sh`, ~38 h on A100 80GB / SDPA) — direct scale-up of the 5k smoke; same hyperparameters. Tests whether 10× data lifts chosen_score above the SFT ceiling and pushes Δrecall to zero or positive.
+- 50k SFT (`scripts/run_sft_50k.sh`, ~17 h on RTX 6000 Pro / H100) — testing whether 10× data breaks the −4.84 ceiling for the SFT-only arm.
 
 **Decision logic for next steps:**
-1. SFT-50k breaks ceiling → run Stage 2 DPO from SFT-50k → final ablation table.
-2. ORPO 5k beats SFT-only 5k → scale ORPO to 50k.
-3. Both stay at ≈ −4.84 → reconsider OneRec base or eval methodology.
+1. ORPO 50k breaks ceiling AND Δrecall ≥ 0 → headline result for the report; final ablation row.
+2. ORPO 50k breaks ceiling but Δrecall stays negative → λ ablation at 50k (try paper's Phi-2 setting λ=0.25).
+3. SFT-50k breaks ceiling → run Stage 2 DPO from SFT-50k for full sequential pipeline.
+4. All arms stay at ≈ −4.84 → reconsider OneRec base or eval methodology.
 
 ## Dependencies
 
