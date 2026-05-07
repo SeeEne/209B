@@ -20,12 +20,20 @@
 #   capacity. So we use the same SFT-arm hyperparameters and add ORPO's
 #   one new knob:
 #
-#     lambda_or = 0.3
-#       Paper's Table 4 default is 0.1 under the *sum*-log-p convention
-#       (log P(y|x) = sum over tokens). This repo scores SIDs with the
-#       *mean*-log-p convention for parity with all other trainers, which
-#       scales the OR-term gradient by 1/3 vs the paper. 0.3 here ≈ paper's
-#       0.1 in equivalent gradient strength.
+#     lambda_or = 0.1   (paper default for Mistral-ORPO; Hong et al. 2024)
+#       Paper Eq. 3 defines log P(y|x) as the LENGTH-NORMALIZED mean
+#       per-token log-likelihood = (1/m) Σ log p_t. That's exactly the
+#       convention every trainer in this repo uses, so 0.1 here is the
+#       literal paper value, no scaling needed. The paper used larger λ
+#       for smaller models (0.25 for Phi-2 2.7B, 0.2 for Llama-2 7B), so
+#       at 1.7B 0.1–0.2 is the defensible range; start at 0.1.
+#
+#   Deviations from the paper's optimization recipe (kept for cross-arm
+#   parity with our SFT/DPO arms, NOT for paper-faithfulness):
+#     - lr = 5e-5 vs paper 8e-6  (parity)
+#     - 1 epoch vs paper 10      (parity + wall clock)
+#     - LoRA r=16 vs full FT     (single-GPU compute)
+#     - linear schedule vs cosine (parity)
 #
 # Hardware target: 1× A100 80GB (Ubuntu 22, CUDA 12). No ref model means
 # peak VRAM is ~30–40 GB at batch=24, leaving plenty of headroom — we
@@ -52,8 +60,26 @@ set -e
 set -o pipefail
 
 # ---- Environment ----
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+# HF Hub backup of every checkpoint as it's saved + final adapter/merged/log.
+# Set HF_PUSH=0 to disable (e.g. for offline dev runs). Repo is created
+# private on first push; layout mirrors runs/<HF_RUN_NAME>/ inside the repo.
+HF_PUSH="${HF_PUSH:-1}"
+HF_REPO_ID="${HF_REPO_ID:-SeeEne/onerec-209b-runs}"
+HF_RUN_NAME="${HF_RUN_NAME:-orpo_5k}"
+
+# Base model: pulled on first run if not already on disk. Override BASE_REPO
+# if you want a different OneRec checkpoint.
+BASE_REPO="${BASE_REPO:-OpenOneRec/OneRec-1.7B}"
+
+# DO NOT set HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE here. Both block Hub
+# traffic, and modern huggingface_hub treats them as the same flag (see
+# constants.py: HF_HUB_OFFLINE = is_true(HF_HUB_OFFLINE or TRANSFORMERS_OFFLINE)).
+# Setting either would break: (a) the auto-pull of the base model below,
+# (b) the checkpoint-streaming callback during training, (c) the eval-
+# artifact push at end-of-run. Local-path model loads via transformers
+# don't phone home in practice, so the offline flag is unnecessary.
+unset HF_HUB_OFFLINE
+unset TRANSFORMERS_OFFLINE
 export OMP_NUM_THREADS=8
 
 # ---- Paths ----
@@ -74,7 +100,7 @@ EVAL_CSV="runs/eval_engaged_orpo_5k_n1000.csv"
 mkdir -p "$EVAL_DIR"
 
 EVAL_N=1000
-LAMBDA_OR=0.3
+LAMBDA_OR=0.1
 
 START=$(date +%s)
 
@@ -85,8 +111,18 @@ fi
 if [ ! -f "$DATA_V1/valid.parquet" ]; then
     echo ">>> [error] v1 valid not found at $DATA_V1/valid.parquet"; exit 1
 fi
-if [ ! -d "$BASE_MODEL" ]; then
-    echo ">>> [error] base model not found at $BASE_MODEL"; exit 1
+# Auto-pull base model if missing (fresh shared-compute box, ~3.5 GB).
+# We exclude assets/* (preview PNGs) — not needed for training.
+if [ ! -d "$BASE_MODEL" ] || [ -z "$(ls -A "$BASE_MODEL" 2>/dev/null)" ]; then
+    echo ""
+    echo "============================================================"
+    echo ">>> base model not at $BASE_MODEL — pulling $BASE_REPO from HF Hub"
+    echo ">>> (~3.5 GB; needs network. Retry on flaky links via --force.)"
+    echo "============================================================"
+    python train/hf_sync.py pull \
+        --repo_id "$BASE_REPO" \
+        --local_path "$BASE_MODEL" \
+        --ignore_patterns "assets/*"
 fi
 
 # ============================================================
@@ -99,9 +135,9 @@ else
     echo ""
     echo "============================================================"
     echo ">>> STEP 1/2: ORPO train  (5,000 groups, ~1.5 h)"
-    echo ">>> lr=5e-5, lora_r=16/alpha=32, batch=24, 1 epoch"
-    echo ">>> lambda_or=$LAMBDA_OR  (≈ paper's 0.1 under sum-log-p; we use mean-log-p so ×3)"
-    echo ">>> nll_loss_scale=1.0    (paper formulation; not match_dpo)"
+    echo ">>> lr=5e-5, lora_r=$LORA_R/alpha=$LORA_ALPHA, batch=$PER_DEVICE_BATCH_SIZE, 1 epoch"
+    echo ">>> lambda_or=$LAMBDA_OR  (paper default; loss uses paper Eq. 3 mean-log-p, no rescaling)"
+    echo ">>> nll_loss_scale=$NLL_LOSS_SCALE    (paper formulation; not match_dpo)"
     echo ">>> from base (single stage, no SFT init, no ref model)"
     echo ">>> out: $RUN"
     echo ">>> log: $TRAIN_LOG"
@@ -113,6 +149,19 @@ else
         sleep 5
     fi
 
+    HF_FLAGS=()
+    if [ "$HF_PUSH" = "1" ]; then
+        HF_FLAGS=(
+            --hf_push
+            --hf_repo_id "$HF_REPO_ID"
+            --hf_run_name "$HF_RUN_NAME"
+            --hf_log_path "$TRAIN_LOG"
+        )
+        echo ">>> HF backup: ON  → $HF_REPO_ID:$HF_RUN_NAME"
+    else
+        echo ">>> HF backup: OFF (set HF_PUSH=1 to enable)"
+    fi
+
     python train/train_orpo.py \
         --model_path "$BASE_MODEL" \
         --template "$TEMPLATE" \
@@ -121,12 +170,13 @@ else
         --output_dir "$RUN" \
         --max_train_groups 5000 --max_eval_groups 1000 \
         --num_checkpoints 5 --logging_steps 25 \
-        --per_device_batch_size 24 --grad_accum 1 \
+        --per_device_batch_size 48 --grad_accum 1 \
         --lr 5e-5 \
         --lambda_or $LAMBDA_OR \
         --nll_loss_scale 1.0 \
         --lora_r 16 --lora_alpha 32 \
         --merge_and_save \
+        "${HF_FLAGS[@]}" \
         2>&1 | tee "$TRAIN_LOG"
 fi
 
@@ -160,6 +210,31 @@ python train/evaluate_engaged.py \
 END=$(date +%s)
 EVAL_MIN=$(( (END - T_AFTER_TRAIN) / 60 ))
 TOTAL_MIN=$(( (END - START) / 60 ))
+
+# ============================================================
+# STEP 3 — push eval artifacts to HF Hub (training-side already pushed)
+# ============================================================
+# The training callback already streamed every checkpoint, and the post-
+# training hook pushed adapter/, merged/, and the train log. The eval
+# log + CSV are produced AFTER train_orpo.py exits, so push them now.
+if [ "$HF_PUSH" = "1" ]; then
+    echo ""
+    echo "============================================================"
+    echo ">>> STEP 3/3: push eval artifacts to $HF_REPO_ID:$HF_RUN_NAME"
+    echo "============================================================"
+    EXTRA_FILES=()
+    [ -f "$EVAL_LOG" ] && EXTRA_FILES+=("$EVAL_LOG")
+    [ -f "$EVAL_CSV" ] && EXTRA_FILES+=("$EVAL_CSV")
+    if [ ${#EXTRA_FILES[@]} -gt 0 ]; then
+        python train/hf_sync.py push \
+            --repo_id "$HF_REPO_ID" \
+            --run_name "$HF_RUN_NAME" \
+            --run_dir "$RUN" \
+            --include \
+            --extra_files "${EXTRA_FILES[@]}" \
+            || echo "[hf-sync] eval push failed (training artifacts already on Hub)"
+    fi
+fi
 
 # ============================================================
 # Summary
@@ -235,8 +310,8 @@ echo "  → Next: still consider 50k ORPO if you want to test if ORPO scales"
 echo "    BETTER than SFT-only with more data."
 echo ""
 echo "If chosen_score > -4.84 (worse than SFT-only):"
-echo "  → OR term is harming chosen log-prob. Try lambda_or=0.1 or"
-echo "    nll_loss_scale=2.0 to up-weight the SFT term."
+echo "  → OR term is harming chosen log-prob. Try lambda_or=0.05 (half of"
+echo "    paper default) or nll_loss_scale=2.0 to up-weight the NLL term."
 echo ""
 echo "For richer trend across the 5 ckpts (~15 min, no beam search):"
 echo "  python diagnose/sft_score_trend.py \\"

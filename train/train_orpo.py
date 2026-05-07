@@ -10,10 +10,12 @@ Optimization without Reference Model").
     L_OR            = −mean( log σ(ratio) )
     L_ORPO          = L_NLL + λ × L_OR
 
-Where P_θ(y|x) is interpreted as the geometric mean per token over the 3 SID
-tokens, i.e. log P_θ(y|x) = (1/3) Σ log p_θ(y_t | x, y_<t). This matches the
-chosen_score / rejected_score convention used everywhere else in this repo
-(SFT trainer, DPO trainer, evaluate_engaged.py).
+Strict paper convention: per Equation 3 of the paper, ``log P_θ(y|x)`` is
+the *length-normalized* average per-token log-likelihood:
+    log P_θ(y|x) = (1/m) Σ_{t=1..m} log p_θ(y_t | x, y_<t)
+This is exactly what our shared ``compute_sid_logprobs`` returns — no
+rescaling needed. ``lambda_or = 0.1`` is the paper default under this
+convention (matches Mistral-ORPO-α/β; Phi-2 used 0.25, Llama-2 used 0.2).
 
 Why ORPO is interesting for this project:
   - No reference model → no ref-cache machinery → ~50% less peak VRAM than
@@ -28,14 +30,20 @@ Why ORPO is interesting for this project:
 Design choices specific to this project (vs the paper):
   - We score the 3 SID tokens only (not the full chat-template envelope),
     consistent with all other trainers/evaluators here.
-  - L_NLL is the same mean-log-p we use in the SFT trainer. For ABLATION
-    PARITY with the SFT-only run, we expose --nll_loss_scale (default 1.0
-    here, since ORPO papers fold the relative weighting into λ; the SFT
-    trainer's 16× scale was a different ablation goal).
+  - L_NLL uses the same mean-log-p we use in the SFT trainer — exactly
+    the paper's Eq. 3 convention. ``--nll_loss_scale`` defaults to 1.0
+    (paper formulation); only raise to up-weight NLL beyond the recipe.
   - Group structure is preserved in the *dataset subsampling* (--G 3 keeps
     us reading the same 5000 users as the SFT and DPO trainers), but is
     NOT used in the loss — vanilla ORPO has no group normalization.
-  - Default λ = 0.1 (paper / OPUS implementation).
+  - Default λ = 0.1 (paper default for Mistral-ORPO-α/β; the paper used
+    0.25 for Phi-2 (2.7B) and 0.2 for Llama-2 (7B), so for our 1.7B
+    model 0.1–0.2 is the defensible range).
+  - We deliberately deviate from the paper on optimization: lr=5e-5 (paper
+    8e-6), 1 epoch (paper 10), LoRA r=16 (paper full fine-tune), linear
+    schedule (paper cosine). All four are for cross-arm parity with the
+    SFT and DPO arms in this project — the loss formulation matches the
+    paper, the optimization recipe matches our other ablation arms.
 
 Numerical stability of log_odds:
   P close to 1 → log(1 − P) → −∞. We use log1mexp(log_p) with the standard
@@ -235,6 +243,9 @@ class ORPOTrainer(Trainer):
             out.last_hidden_state, lm_head,
             inputs["input_ids"], prompt_lens,
         )
+        # Per paper Eq. 3, log P_θ(y|x) is length-normalized to per-token
+        # mean — exactly what compute_sid_logprobs returns. No rescaling.
+        # lambda_or = 0.1 (paper default for Mistral-ORPO) applies directly.
         loss, components = compute_orpo_loss(
             chosen_score, rejected_score,
             lambda_or=self.lambda_or,
@@ -253,6 +264,7 @@ class ORPOTrainer(Trainer):
         if self.state.global_step % 100 == 0 and torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1e9
             peak = torch.cuda.max_memory_allocated() / 1e9
+            # All values in paper's mean-log-p convention (Eq. 3 of paper).
             print(f"[mem] step={self.state.global_step} "
                   f"alloc={alloc:.2f}G peak={peak:.2f}G "
                   f"loss={loss.item():.3f} "
@@ -294,9 +306,12 @@ def compute_metrics(eval_pred):
     """Returns chosen / rejected absolute log-prob, the linear margin,
     pref_acc, AND ``log_odds_margin`` (= what L_OR actually optimizes).
 
-    log_odds_margin is the ORPO-specific signal: pref_acc and linear margin
-    can climb while log_odds_margin saturates, because log_odds compresses
-    near P→1. Worth tracking separately when interpreting OR-term behavior.
+    All in paper's mean-log-p convention (Eq. 3): chosen_score and
+    rejected_score are length-normalized per-token log-probs, directly
+    comparable to the SFT/DPO arms' chosen_score reference points
+    (e.g. SFT-only 5k: -4.841). log_odds_margin is what the OR-term
+    sigmoid actually consumes; pref_acc / margin saturate but
+    log_odds_margin tracks gradient pressure faithfully.
     """
     scores = eval_pred.predictions
     if isinstance(scores, tuple):
@@ -354,15 +369,14 @@ def main():
 
     # ORPO
     parser.add_argument(
-        "--lambda_or", type=float, default=0.3,
-        help="Weight on the odds-ratio term. Paper default is 0.1 under the "
-             "*sum*-log-p convention (log P(y|x) = sum over tokens). This repo "
-             "scores SIDs with the *mean*-log-p convention (chosen_score = "
-             "(1/3) * sum log p_t) for consistency with all other trainers, "
-             "which scales the OR-term gradient by 1/3 vs the paper. Default "
-             "0.3 here ≈ paper's 0.1 in equivalent gradient strength. Drop to "
-             "0.1 for a literal-paper recipe; raise to 1.0 for stronger "
-             "discriminative pressure.",
+        "--lambda_or", type=float, default=0.1,
+        help="Weight on the odds-ratio term. Paper default for Mistral-ORPO: "
+             "0.1 (Hong et al. 2024). Other paper experiments: 0.2 for "
+             "Llama-2 (7B), 0.25 for Phi-2 (2.7B). Our base is 1.7B, so "
+             "0.1-0.2 is the defensible range — start at 0.1 (literal "
+             "paper default) and only consider 0.2 if results suggest "
+             "the OR term is under-weighted. Loss uses the paper's "
+             "length-normalized mean-log-p convention (Eq. 3).",
     )
     parser.add_argument(
         "--nll_loss_scale", type=float, default=1.0,
@@ -414,6 +428,35 @@ def main():
              "pref_acc / margin can grow even if chosen log-prob drops "
              "(both sides go down, rejected faster). chosen_score directly "
              "correlates with recall_chosen on the engagement valid.",
+    )
+
+    # ---- HF Hub backup (for ephemeral / shared compute) ----
+    parser.add_argument(
+        "--hf_push", action="store_true",
+        help="Mirror this run to HF Hub during training. Each Trainer save "
+             "is uploaded as it lands; final adapter/, merged/, and the "
+             "training log are pushed at the end. Requires HF token at "
+             "~/.cache/huggingface/token. Disable HF_HUB_OFFLINE=1 in env "
+             "(it would block uploads); TRANSFORMERS_OFFLINE=1 is fine.",
+    )
+    parser.add_argument(
+        "--hf_repo_id", default="SeeEne/onerec-209b-runs",
+        help="HF repo to push to. Created if missing (private by default).",
+    )
+    parser.add_argument(
+        "--hf_run_name", default=None,
+        help="Subpath within --hf_repo_id. Defaults to basename of "
+             "--output_dir (e.g. runs/orpo_5k → 'orpo_5k').",
+    )
+    parser.add_argument(
+        "--hf_log_path", default=None,
+        help="Optional training-stdout log to push at end-of-run. The "
+             "convention in this project is runs/<name>.log (sibling of "
+             "--output_dir, NOT inside it).",
+    )
+    parser.add_argument(
+        "--hf_public", action="store_true",
+        help="Create the repo as public (default: private).",
     )
 
     args = parser.parse_args()
@@ -548,6 +591,19 @@ def main():
         optim="adamw_torch_fused",
     )
 
+    callbacks = [TimingCallback()]
+    hf_run_name = args.hf_run_name or Path(args.output_dir).name
+    if args.hf_push:
+        from hf_sync import HFCheckpointSyncCallback
+        callbacks.append(HFCheckpointSyncCallback(
+            repo_id=args.hf_repo_id,
+            run_subpath=hf_run_name,
+            run_dir=args.output_dir,
+            private=not args.hf_public,
+        ))
+        print(f"[hf-sync] callback armed: ckpts will stream to "
+              f"{args.hf_repo_id}:{hf_run_name}/")
+
     trainer = ORPOTrainer(
         model=model,
         args=training_args,
@@ -557,7 +613,7 @@ def main():
         compute_metrics=compute_metrics,
         lambda_or=args.lambda_or,
         nll_loss_scale=args.nll_loss_scale,
-        callbacks=[TimingCallback()],
+        callbacks=callbacks,
     )
 
     print("\n===== Training =====")
@@ -603,6 +659,24 @@ def main():
         merged.save_pretrained(str(merged_dir))
         tokenizer.save_pretrained(str(merged_dir))
         print(f"Saved merged checkpoint to {merged_dir}")
+
+    # ---- HF push of final artifacts (after merge so merged/ is included) ----
+    if args.hf_push:
+        from hf_sync import push_run_artifacts
+        # Default include = adapter + merged. checkpoint-* folders were
+        # already streamed by the on_save callback during training.
+        include_dirs = ["adapter"]
+        if args.merge_and_save:
+            include_dirs.append("merged")
+        print("\n===== HF push of final artifacts =====")
+        push_run_artifacts(
+            repo_id=args.hf_repo_id,
+            run_subpath=hf_run_name,
+            run_dir=str(out_dir),
+            log_path=args.hf_log_path,
+            include_dirs=include_dirs,
+            private=not args.hf_public,
+        )
 
 
 if __name__ == "__main__":
