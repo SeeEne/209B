@@ -1,0 +1,15 @@
+{
+  "metric_kind": "engaged",
+  "model_path": "model/OneRec-1.7B",
+  "valid_parquet": "data/contrastive_dataset_v1/valid.parquet",
+  "n": 7940,
+  "num_beams": 32,
+  "topk": 96,
+  "batch_size": 4,
+  "recall_chosen": 0.012006717044500417,
+  "recall_rejected": 0.02455919395465995,
+  "delta_recall": -0.012552476910159531,
+  "pass_chosen": 0.03438287153652393,
+  "pass_rejected": 0.06397984886649874,
+  "delta_pass": -0.029596977329974808
+}
