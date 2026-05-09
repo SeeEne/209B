@@ -1,13 +1,18 @@
 # Experiment Journey
 
-This directory holds code from intermediate experiments. The chosen path
-forward is **DPO + SFT + group-normalized contrastive loss**, implemented at
-project root and in `train/train_contrastive_dpo_g_normalize.py`. Everything
-here in `archive/` was a meaningful step on the way there — kept for
-reproducibility and for the report's ablation chapter.
+This file documents the full 14-step research arc of the project, from
+the initial pivot away from DPO triplets through the final ablation. The
+project converged to the simplest viable arm: **SFT-only on the chosen
+branch**, with **ORPO** as a confirmed within-noise alternative. Every
+contrastive variant we built either mode-collapsed, crashed absolute
+chosen recall, or settled into a degenerate basin where both chosen and
+rejected log-probs plummet together. Documenting *why* those failures
+happened — and the structural reason ORPO ties with SFT despite a
+fundamentally different objective — is the project's main contribution.
 
 This file records *why* each step was taken and *what we learned* before
-moving on. Read top-to-bottom for the narrative.
+moving on. Read top-to-bottom for the narrative; Step 14 is the final
+summary.
 
 ---
 
@@ -256,7 +261,7 @@ SFT term.
 
 ---
 
-### Step 7. DPO + SFT + group normalization (chosen path)
+### Step 7. DPO + SFT + group normalization (originally proposed as the chosen path; eventually superseded — see Step 13B and Step 14)
 
 Three forces, three jobs:
 
@@ -341,21 +346,31 @@ estimates (~1/2 the SE of n=1000) for arms where they exist.
 | ORPO 5k (Step 8, 2026-05-07) | 1000 | 0.0107 | 0.0123 | −0.0017 | −0.0060 |
 | **SFT-only 50k (Step 12)** | **1000** | **0.0117** | **0.0110** | **+0.0007** | **+0.0010** |
 | **SFT-only 50k (Step 12)** | **5000** | **0.0140** | **0.0132** | **+0.0008** | **+0.0052** |
-| ORPO 50k (Step 13, in-flight) | — | TBD | TBD | TBD | TBD |
-| SFT-50k → DPO+anchor 50k (Step 13, in-flight) | — | TBD | TBD | TBD | TBD |
+| **baseline (final, n=7940)** | **7940** | **0.0120** | **0.0246** | **−0.0126** | **−0.0296** |
+| **SFT-only 50k (final, n=7940)** | **7940** | **0.0143** | **0.0146** | **−0.0003** | **+0.0018** |
+| **ORPO 50k (final, n=7940)** | **7940** | **0.0141** | **0.0143** | **−0.0002** | **+0.0021** |
+| **SFT-50k → DPO+anchor 50k (final, n=7940)** | **7940** | **0.0098** | **0.0041** | **+0.0057** | **+0.0161** |
 
 **Read at 5k**: ORPO is the best single-stage arm; sequential SFT→DPO's
 "+0.0037" is a false positive (collapse mode — see Step 10).
 
-**Read at 50k**: SFT-50k is the first arm to lift recall_chosen
-*absolutely above baseline* (+50%, t≈4.7) AND flip Δrecall positive.
-Δrecall=+0.0008 alone is t≈0.6 at n=5000 (not p<0.05), but
-recall_chosen lift vs baseline IS statistically robust, and all 4
-metrics agree on direction.
+**Read at 50k (final, n=7940 full v1 valid)**:
 
-**Watch for in Step 13 50k follow-ups:** `recall_chosen ≥ 0.014` (at
-or above SFT-50k's level) AND `Δrecall ≥ +0.001` (clearly positive).
-SFT-50k itself is the bar to beat.
+- **SFT-only 50k is the headline winner**: highest absolute chosen
+  recall (0.0143, +19% vs baseline), Δrecall and Δpass both flipped
+  to ≈ 0 (from baseline's strongly negative −0.0126 / −0.0296), no
+  failure mode.
+- **ORPO 50k tied with SFT** within noise (chosen 0.0141 vs SFT 0.0143,
+  paired SE ≈ 0.0013). Despite a fundamentally different objective,
+  ORPO's OR term added no measurable lift over plain NLL — driven by
+  small-vocab + shared-context zero-sum (see Step 14).
+- **DPO + SFT-anchor 50k crashed chosen below baseline** (0.0098 vs
+  baseline 0.0120). It produced the largest Δrecall (+0.0057) but at
+  the cost of dragging chosen down — classic contrastive collapse,
+  see Step 13B post-mortem.
+
+The 5k headline trend (ORPO best single-stage) survives at scale, with
+SFT-only catching up at 50k and the contrastive arm regressing.
 
 ---
 
@@ -613,126 +628,276 @@ swing of +0.025 vs SE 0.004 → t≈6.6.
 
 ---
 
-## Step 13 — Two finalists in flight (2026-05-07)
+## Step 13 — Two 50k finalists, both completed (2026-05-09)
 
 With SFT-50k as a defensible positive baseline (Step 12), two 50k arms
-run in parallel to settle the final ablation:
+ran in parallel on different servers to settle the final ablation. Both
+completed; final eval below uses **n=7940 (full v1 valid)** for
+headline-quality SE (~0.0008 paired).
 
-**Arm A — ORPO 50k** (server B, `scripts/run_orpo_50k.sh`):
-direct scale-up of Step 8's ORPO 5k smoke. Same hyperparams. Tests
-whether the OR term gives net additional Δ improvement over SFT alone,
-given that ORPO 5k matched SFT-only chosen_score but had ~10% better
-recall_chosen.
+### Step 13A — ORPO 50k (completed)
 
-**Arm B — SFT-50k → DPO + light anchor 50k** (server A,
-`scripts/run_dpo_anchor_from_sft_50k.sh`): Stage 2 sequential, with
-`sft_weight=0.15 raw` (~19% SFT contribution post-warmup) added
-specifically to prevent the Step 10 collapse mode. Uses the joint
-trainer (only one with a configurable SFT-anchor knob); ref model is
-SFT-50k. With SFT-50k's recall_chosen already at 0.0140 (vs Step 10's
-0.0097 starting point), DPO has more headroom to push rejected down
-without crashing chosen.
+`scripts/run_orpo_50k.sh`, server B (A100 80GB, ~38 h with SDPA).
+Direct scale-up of Step 8's 5k ORPO smoke, same hyperparameters
+(λ=0.1, lr=5e-5, lora_r=16). No ref model, no group normalization.
 
-Both ~38 h on their respective hardware. Whichever wins (or both lose)
-on engagement-aware n=5000 settles the project's recommendation.
+| Metric | baseline | SFT-50k | **ORPO 50k** |
+|---|---:|---:|---:|
+| recall_chosen | 0.0120 | 0.0143 | **0.0141** |
+| recall_rejected | 0.0246 | 0.0146 | **0.0143** |
+| Δrecall | −0.0126 | −0.0003 | **−0.0002** |
+| pass_chosen | 0.0344 | 0.0411 | **0.0407** |
+| Δpass | −0.0296 | +0.0018 | **+0.0021** |
 
-**Decision rules:**
-- Both arms beat SFT-50k recall_chosen AND ORPO > sequential
-  → headline = ORPO (simpler, no ref).
-- Both beat SFT-50k AND sequential > ORPO
-  → headline = sequential (validates the SFT→DPO recipe).
-- Either crashes recall_chosen below SFT-50k
-  → tune that arm's knob (λ for ORPO, sft_weight for anchor) before
-  declaring failure.
-- Neither meaningfully beats SFT-50k
-  → headline = SFT-50k itself; project finding still stands.
+**Outcome — tied with SFT-50k within noise** on every metric. Differences
+of 0.0001–0.0003 against paired SE 0.0013 ≈ noise floor.
+
+**Why this is a result, not a non-result.** Two different objectives
+(plain NLL vs NLL + λ·odds-ratio contrastive) converged to the same
+recall numbers despite ORPO having an explicit term to suppress
+rejected. The structural reason is non-trivial and is the project's
+deepest finding — see Step 14. Briefly: when chosen and rejected share
+a narrow categorical output space (8,192-entry SID codebook + same user
+context, vs 50k–150k for standard LLMs), SFT's implicit zero-sum
+redistribution already drains the
+rejected items, so the OR term has nothing extra to do. The 5k smoke
+hint that "ORPO has +10% recall_chosen over SFT-only at iso-data"
+(Step 8) didn't survive at 50k — both arms hit the same data ceiling.
+
+### Step 13B — SFT-50k → DPO + SFT-anchor 50k (completed, failure mode)
+
+`scripts/run_dpo_anchor_from_sft_50k.sh`, server A (RTX 6000 Pro, ~38 h
+incl. ~5 h ref-score precompute). Stage 2 sequential from SFT-50k,
+with `sft_weight=0.15 raw` (~19% SFT contribution post-warmup) added
+specifically to prevent the Step 10 cold-start collapse. Uses the joint
+trainer (only one with a configurable SFT-anchor knob); ref model =
+SFT-50k.
+
+| Metric | baseline | SFT-50k start | **DPO+anchor 50k** |
+|---|---:|---:|---:|
+| recall_chosen | 0.0120 | 0.0143 | **0.0098** ⚠️ |
+| recall_rejected | 0.0246 | 0.0146 | **0.0041** |
+| Δrecall | −0.0126 | −0.0003 | **+0.0057** |
+| pass_chosen | 0.0344 | 0.0411 | **0.0282** ⚠️ |
+| Δpass | −0.0296 | +0.0018 | **+0.0161** |
+
+**Outcome — largest Δrecall and Δpass of any arm, but chosen recall
+crashed below baseline.** Δrecall=+0.0057 cleared p<0.05 (≈ 7σ at
+n=7940); Δpass=+0.0161 likewise. **But** recall_chosen dropped 31%
+from the SFT-50k starting point and ended **18% below baseline**. Pass@96
+chosen dropped from 0.0411 to 0.0282 (also below baseline 0.0344).
+
+**Root cause — post-warmup contrastive collapse, distinct from Step 10.**
+Step 10 was *start-of-training* collapse (margin=0 at step 0 → both
+basins equally close → model picks the cheap one). Step 13B has a
+positive starting margin from SFT-50k, but **once DPO momentum builds,
+the gradient direction that minimizes the contrastive loss most
+efficiently is "push rejected hard down, let chosen drift down with
+it"**. Specifically:
+- Group-normalized DPO contributes ~81% of the post-warmup gradient
+  magnitude (β=0.1 on margin amplified ~16× by `1/std_g`)
+- SFT-anchor at sft_weight=0.15 raw contributes ~19% — the only force
+  pulling chosen up
+- Implicit KL via ref baseline (= SFT-50k) is a *direction* constraint
+  on the (chosen − rejected) gap, **not** an absolute floor on chosen.
+  Chosen can drift below ref as long as rejected drifts faster.
+
+The 0.15 anchor was strong enough to prevent Step 10's catastrophic
+chosen-log-P crash (which fell 8.6 nats over 625 steps) but too weak
+to keep chosen above baseline once contrastive momentum took over.
+
+**Could it be salvaged?** Likely yes, by raising sft_weight to
+0.5–1.0 (raw). Not pursued — the project timeline closed and SFT-50k
+already carries the headline finding. Documented as an open knob for
+future work.
 
 **Files (active):** `scripts/run_orpo_50k.sh`,
 `scripts/run_dpo_anchor_from_sft_50k.sh`,
-`scripts/run_dpo_from_sft_50k.sh` (pure-DPO control arm; not currently
-scheduled to run unless Arm B's anchor proves too weak / too strong).
+`scripts/run_dpo_from_sft_50k.sh` (pure-DPO control arm without anchor;
+never run as the anchor arm's behavior is sufficient evidence of the
+collapse mode).
 
 ---
 
-## Final ablation table (planned, fills in after Step 13 completes)
+## Final ablation table (n=7940 full v1 valid, completed 2026-05-09)
 
-Once both 50k arms finish, run the *headline-quality* numbers for the
-report. All previous tables in this file used n=1000 or n=5000 subsets
-of v1 valid; the final table replaces those with the full held-out set
-plus a comparable benchmark number.
+All numbers below are the headline values for the report. Engagement-
+aware Δrecall / Δpass on the full held-out v1 valid set (n=7940,
+paired SE ≈ 0.0008). OneRec-paper Recall@32 on v1_test was
+deferred — `video_test.parquet` is 38,781 rows × 4 arms × ~5–6 h batched
+≈ ~22 h compute, deferred past the project deadline. Engagement-aware
+Δrecall is the primary metric; Recall@32 would have been a secondary
+"degradation expected by design" reading.
 
-**Two metrics, one table:**
+| Arm | recall_chosen | recall_rejected | Δrecall | pass_chosen | pass_rejected | Δpass |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline (no FT) | 0.0120 | 0.0246 | −0.0126 | 0.0344 | 0.0640 | −0.0296 |
+| **SFT-50k (Step 12)** | **0.0143** | 0.0146 | −0.0003 | **0.0411** | 0.0393 | +0.0018 |
+| ORPO 50k (Step 13A) | 0.0141 | 0.0143 | −0.0002 | 0.0407 | 0.0385 | +0.0021 |
+| SFT-50k → DPO+anchor 50k (Step 13B) | 0.0098 | **0.0041** | **+0.0057** | 0.0282 | **0.0121** | **+0.0161** |
 
-1. **Engagement-aware on full v1 valid** —
-   `python train/evaluate_engaged.py --n -1` (or `--n 14000` covering all
-   ~14k held-out rows from `data/contrastive_dataset_v1/valid.parquet`).
-   Tightens Δrecall SE from ~0.0013 (n=5000 paired) to ~0.0008
-   (n=14000 paired), enough to potentially clear p<0.05 on Δrecall ≥
-   +0.0016 — a bar SFT-50k's +0.0008 sits below but the 50k DPO/ORPO
-   arms might clear.
+**Reading the table:**
 
-2. **OneRec-paper Recall@32 / Pass@32 on `v1_test` benchmark** —
-   `python train/evaluate_origin.py` on
-   `data/OpenOneRec/benchmark_data/video/video_test.parquet` (38,781
-   rows, completely disjoint from master in uids — the OneRec paper's
-   Table 4 metric). This is the *secondary* metric: our training
-   objective deliberately deprioritizes "next-shown but non-engaged"
-   items, so absolute Recall@32 is *expected to drop* below baseline
-   for any successful arm. Reported anyway for direct comparison
-   against published OneRec numbers.
+- **SFT-50k = headline winner.** Highest absolute chosen recall and
+  pass; Δ flipped from baseline's strongly negative to ≈ 0; no failure
+  mode. This is the simplest possible arm (no ref, no contrastive, no
+  group norm) and it wins on every absolute-metric column.
+- **ORPO 50k tied with SFT** within noise (chosen 0.0141 vs SFT 0.0143
+  vs paired SE 0.0013). Independent confirmation of SFT's number from a
+  fundamentally different objective.
+- **DPO+anchor 50k wins Δ but crashes chosen.** Largest Δrecall
+  (+0.0057, p<0.05) and Δpass (+0.0161, p<0.05) — these are real signals.
+  But chosen pass and recall are both *below baseline*. Useful as a
+  documented failure mode of the contrastive arm at this anchor weight.
 
-| Arm | recall_chosen | recall_rejected | Δrecall | Δpass | Recall@32 (v1_test) | Pass@32 (v1_test) |
-|---|---|---|---|---|---|---|
-| baseline (no FT) | TBD | TBD | TBD | TBD | TBD | TBD |
-| SFT-50k (Step 12) | TBD | TBD | TBD | TBD | TBD | TBD |
-| SFT-50k → DPO+anchor 50k (Step 13B) | TBD | TBD | TBD | TBD | TBD | TBD |
-| ORPO 50k (Step 13A) | TBD | TBD | TBD | TBD | TBD | TBD |
+**Statistical notes:**
+- Δrecall paired SE ≈ 0.0008 at n=7940 → anything ≥ +0.0016 is
+  p<0.05 (one-sided). DPO+anchor's +0.0057 clears this; SFT and ORPO's
+  ≈ 0 do not (consistent with their tied-with-baseline reading).
+- recall_chosen lift SFT-50k vs baseline: 0.0143 vs 0.0120, t≈2.6 at
+  n=7940 (p≈0.005, two-sided) — formally significant.
+- recall_chosen drop DPO+anchor vs baseline: 0.0098 vs 0.0120,
+  t≈−2.5 → formally significant *deterioration*.
 
-Cells fill in after Step 13's two arms finish (~2026-05-09).
+---
 
-**Wall-clock budget for the final evals.** Naive sequential cost with
-the current `evaluate_engaged.py` (batch_size=1, num_beams=32,
-~1.8 s/row) would be:
+## Step 14 — Project summary and takeaways (2026-05-09)
 
-| Eval | Rows | Time/model | 4 models sequential |
-|---|---|---|---|
-| Full v1 valid (engagement-aware) | ~14,000 | ~7 h | ~28 h |
-| Full v1_test benchmark (Recall@32) | 38,781 | ~19 h | ~76 h |
-| **Total** | | | **~104 h** |
+This is the closing summary; no further experiments planned.
 
-Two engineering changes applied jointly bring this to ~13 h:
+### What the project showed
 
-**(1) Batched evaluator.** `evaluate_engaged.py` and
-`evaluate_origin.py` are currently `batch_size=1` per
-`model.generate()` call. Padded batched generate at `batch=4` with
-`num_beams=32` cuts per-row time ~3.5×; `batch=8` (~7× speedup) is
-plausible on 80 GB cards since KV-cache headroom is the binding
-constraint. One-time refactor; permanent speedup for every future
-sweep.
+**Yes** — user behavior signals (longview / like / follow / forward) can
+directly replace the Reward Model when constructing preference data for
+offline alignment of a generative recommender. The simplest possible
+recipe — **plain SFT on the chosen branch with no contrastive term, no
+ref model, no group normalization** — lifts engagement-aware
+recall_chosen from 0.0120 (baseline) to 0.0143 (+19%, p≈0.005) and
+flips Δrecall sign from baseline's strongly biased −0.0126 to ≈ 0. No
+Reward Model required.
 
-**(2) Two-server parallel split.** Servers A (RTX 6000 Pro / H100,
-SFT/DPO host) and B (A100 80GB, ORPO host) each evaluate two arms.
+The original research bet ("DPO + SFT + group-normalized contrastive
+loss is the right method") turned out to be **the wrong arm to favor**.
+It's the most complex arm we built, has the most failure modes (Step 6,
+Step 9, Step 10, Step 13B all fall under variants of it), and its
+final 50k incarnation (Step 13B) crashed chosen recall below baseline.
+Reporting this is part of the contribution.
 
-| Server | Arms | Models | Time (batched batch=4, full v1 valid + full v1_test) |
-|---|---|---|---|
-| **Server B** | baseline (no FT), ORPO 50k | OneRec-1.7B base, `runs/orpo_50k/merged` | ~15 h |
-| **Server A** | SFT-50k, SFT-50k → DPO+anchor 50k | `runs/sft_only_50k/merged`, `runs/dpo_anchor_from_sft_50k/merged` | ~15 h |
+### The ORPO ≈ SFT finding (deepest takeaway)
 
-Per-model batched cost: ~2 h (full v1 valid) + ~5.5 h (full v1_test) ≈
-~7.5 h × 2 arms ≈ ~15 h per server. Bottleneck is whichever server
-finishes second → **total wall-clock ~15 h** (vs the ~104 h naive
-estimate, ~7× speedup overall).
+ORPO (single-stage, λ-weighted log-odds contrastive on top of NLL) was
+designed to add discriminative pressure that plain NLL doesn't have. On
+this task it tied with SFT to within noise on every measured metric.
+The structural reason generalizes:
 
-Cuts to ~10 h if `batch=8` clears VRAM on both servers; worth a quick
-batch-size sanity test at the start of the eval sweep before
-committing.
+> **When chosen and rejected share a narrow categorical output space,
+> contrastive alignment objectives' marginal gains over plain SFT are
+> absorbed by SFT's implicit zero-sum redistribution.**
 
-**Statistical caveats to record alongside numbers:**
-- Δrecall on full v1 valid will have SE ~0.0008. Anything ≥ +0.0016 is
-  p<0.05 (one-sided); below that, report point estimate but flag as
-  not formally significant.
-- Recall@32 on v1_test directly tests the OneRec paper's chosen
-  metric. Expect *all* arms to score below baseline here — that is the
-  "Step 4 metric mismatch" issue surfacing for a final time. The
-  framing is "we trade-off official Recall@K for engagement-aware
-  Δrecall", not "we beat the OneRec paper".
+Three conditions, all present in our setup, all needed:
+
+1. **Small vocabulary** (codebook K = 8,192, vs 50k–150k for standard LLMs;
+   confirmed empirically from the SID values in the data).
+   Pushing P(chosen_token) up by Δ drains Δ from K−1 entries — smaller
+   K means less dilution and more concentrated zero-sum.
+2. **Chosen and rejected share user context.** They live in the same
+   high-prob region of the codebook. SFT's push on chosen drains
+   probability mass from rejected as the nearest neighbor — for free,
+   without any rejected supervision. (Numerical evidence: SFT-50k drops
+   recall_rejected from 0.0246 to 0.0146 *despite never seeing rejected
+   in training*.)
+3. **LoRA r=16 + 50k pairs hits a capacity ceiling.** Both arms
+   saturate per-token chosen log P at ≈ −4.795 nats; lr/lora_r sweeps
+   confirm data is the binding constraint, not optimization. ORPO's
+   residual contrastive signal (after λ=0.1 weighting) doesn't have
+   free LoRA capacity to walk to a different fixed point.
+
+Remove condition (1) (use a standard LLM vocab) or (2) (use a different
+prompt for y₊ vs y₋, as in standard RLHF) and this collapse should
+disappear — ORPO's published wins on Mistral-on-UltraFeedback are
+exactly that regime. The takeaway is task-shaped, not method-shaped:
+**generative recommenders sit in a corner of the design space where
+contrastive preference objectives are largely redundant.**
+
+### The contrastive-collapse finding (operational takeaway)
+
+Five contrastive variants in the project failed in the same way:
+
+| Step | Arm | Failure |
+|---|---|---|
+| 1 | Length=1 contrastive | Mode collapse to ~10 popular SIDs |
+| 5 | Group-norm contrastive 50k | chosen recall halved from baseline |
+| 6 | Joint DPO+SFT 5k (post-fix) | No improvement over baseline |
+| 7 | Sequential SFT→DPO 5k | chosen log P crashed 8.6 nats |
+| 13B | DPO + SFT-anchor 50k | chosen recall crashed below baseline |
+
+Each is a slightly different geometry of the same root cause: any loss
+of the form `softplus(−(c − r))` or its DPO variant has two minima —
+"push c up, push r down" (intended) and "push both down asymmetrically,
+just push r more" (cheaper). In a small-vocab, shared-context regime,
+the second minimum is easier to reach. SFT-anchor terms can in
+principle prevent it, but only if their gradient contribution dominates
+the contrastive contribution, which means anchor-weight calibration
+matters more than is usually appreciated.
+
+We document Step 13B's `sft_weight=0.15 raw` (≈19% gradient share)
+**as too weak** for this regime. A future-work knob to try is
+`sft_weight ∈ {0.5, 1.0}` (raw) — likely sufficient to keep chosen at
+or above SFT-50k while letting DPO push rejected down.
+
+### What the headline number actually means
+
+SFT-50k achieves Δrecall ≈ 0 — *not* a positive Δ. Read carefully, that
+is the project's main quantitative result:
+
+> **The OneRec base model is biased *toward* non-engaged items**
+> (recall_rejected = 2× recall_chosen on baseline). 50k pairs of
+> behavior-signal SFT pull this bias from −0.0126 to ≈ 0 — i.e.
+> debiases the model. It does not (yet) make it positively prefer
+> engaged items, but the strongly anti-aligned baseline is removed.
+
+The companion Δpass = +0.0018 / +0.0021 (SFT / ORPO) is small but
+consistently positive and consistently directionally correct; it's the
+weakest "model is now neutral or slightly preference-aligned" reading
+that matches the data. Future scale-up (200k, 500k pairs?) would test
+whether the trajectory continues: if Δrecall keeps drifting from −0.013
+through 0 toward a positive number, the project's claim strengthens. If
+it saturates around 0, the conclusion is "behavior-signal SFT debiases
+but does not align."
+
+### Method recommendation for follow-up work
+
+For anyone building on this:
+
+1. **Default to SFT-only on the chosen branch** in offline behavior-
+   signal regimes with narrow categorical output spaces. Don't reach
+   for contrastive objectives without a specific reason.
+2. **If you do build a contrastive arm**, anchor-weight calibration is
+   the single most important hyperparameter. sft_weight in the 0.5–1.0
+   raw range (or use `--sft_scale_mode match_dpo` with weight 1.0) is
+   the safer default than the 0.15 we tested.
+3. **Don't trust eval_pref_acc as a method-success proxy.** Step 9's
+   joint trainer hit pref_acc=0.546 (random) yet had recall_chosen
+   moving the right way — and Step 5's group-norm 5k smoke had
+   pref_acc up but chosen recall crashing at scale. Engagement-aware
+   recall is the only metric we found that doesn't lie.
+4. **Use forward-only chosen_score (no beam search) for hyperparameter
+   sweeps.** `diagnose/sft_score_trend.py` is ~30× faster than full
+   beam-based recall and tracked the headline metric closely across
+   all our runs (validated in Steps 11–12).
+
+### Final state of the repo
+
+- `train/train_sft_only.py` and `scripts/run_sft_50k.sh` are the
+  recommended training path going forward.
+- `train/train_orpo.py` and `scripts/run_orpo_50k.sh` are kept as
+  the "tied alternative" — useful for anyone wanting the ref-model-
+  free single-stage formulation.
+- `train/train_contrastive_dpo_g_normalize.py` and the DPO-related
+  scripts are retained as the documented contrastive arm; their
+  failure modes are part of the contribution. The 0.15 anchor weight
+  in `scripts/run_dpo_anchor_from_sft_50k.sh` is documented as too
+  weak — anyone reusing this trainer should bump anchor weight first.
+- `train/evaluate_engaged.py` is the canonical headline-metric tool;
+  `train/evaluate_origin.py` remains for OneRec-paper comparisons that
+  weren't run for this project but could be in future work.

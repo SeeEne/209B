@@ -275,11 +275,12 @@ contrastive pull, chosen drifts.
 ORPO and SFT have very different objectives, yet their chosen and rejected
 recall both end up tied within noise. Three structural reasons stack up:
 
-**1. Small vocabulary makes zero-sum redistribution local.** At each
-generation step the model picks from a codebook of K ≈ 2048 entries (vs ~50k
-for standard LLMs). When SFT pushes P(chosen_token) up by Δ, the remaining
-K−1 entries proportionally lose Δ. Smaller K → less dilution → more
-concentrated zero-sum.
+**1. Small vocabulary makes zero-sum redistribution local.** At each SID-token
+generation step, the model effectively picks from a codebook of **K = 8,192**
+entries (vs ~50k–150k for standard LLMs — 6–18× smaller; we confirm K=8192
+empirically from the data in the notebook). When SFT pushes P(chosen_token)
+up by Δ, the remaining K−1 entries proportionally lose Δ. Smaller K → less
+dilution → more concentrated zero-sum.
 
 **2. Chosen and rejected share user context.** Both come from the same
 session. They live in the same high-prob region of the codebook. So when SFT
