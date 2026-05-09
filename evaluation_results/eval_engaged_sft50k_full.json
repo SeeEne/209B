@@ -1,0 +1,15 @@
+{
+  "metric_kind": "engaged",
+  "model_path": "model/OneRec-1.7B-sft50k",
+  "valid_parquet": "data/contrastive_dataset_v1/valid.parquet",
+  "n": 7940,
+  "num_beams": 32,
+  "topk": 96,
+  "batch_size": 4,
+  "recall_chosen": 0.014273719563392106,
+  "recall_rejected": 0.014609571788413097,
+  "delta_recall": -0.00033585222502099076,
+  "pass_chosen": 0.04105793450881612,
+  "pass_rejected": 0.03929471032745592,
+  "delta_pass": 0.0017632241813601984
+}

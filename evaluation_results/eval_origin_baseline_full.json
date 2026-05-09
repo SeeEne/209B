@@ -1,0 +1,11 @@
+{
+  "metric_kind": "origin",
+  "model_path": "model/OneRec-1.7B",
+  "benchmark": "data/OpenOneRec/benchmark_data/video/video_test.parquet",
+  "n": 38781,
+  "num_beams": 32,
+  "batch_size": 4,
+  "recall_at_32": 0.028608255228894205,
+  "pass_at_32": 0.17601402748768727,
+  "position1_pass": 0.04963770918748872
+}
