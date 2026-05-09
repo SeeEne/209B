@@ -1,0 +1,15 @@
+{
+  "metric_kind": "engaged",
+  "model_path": "runs/orpo_50k/merged",
+  "valid_parquet": "data/contrastive_dataset_v1/valid.parquet",
+  "n": 7940,
+  "num_beams": 32,
+  "topk": 96,
+  "batch_size": 4,
+  "recall_chosen": 0.014105793450881612,
+  "recall_rejected": 0.014273719563392106,
+  "delta_recall": -0.0001679261125104945,
+  "pass_chosen": 0.040680100755667505,
+  "pass_rejected": 0.03853904282115869,
+  "delta_pass": 0.0021410579345088124
+}
