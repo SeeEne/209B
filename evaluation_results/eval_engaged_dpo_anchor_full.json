@@ -1,0 +1,15 @@
+{
+  "metric_kind": "engaged",
+  "model_path": "runs/dpo_anchor_from_sft_50k/merged",
+  "valid_parquet": "data/contrastive_dataset_v1/valid.parquet",
+  "n": 7940,
+  "num_beams": 32,
+  "topk": 96,
+  "batch_size": 4,
+  "recall_chosen": 0.009781696053736355,
+  "recall_rejected": 0.004072208228379512,
+  "delta_recall": 0.005709487825356843,
+  "pass_chosen": 0.028211586901763223,
+  "pass_rejected": 0.012090680100755667,
+  "delta_pass": 0.016120906801007556
+}
