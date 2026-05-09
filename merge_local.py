@@ -20,21 +20,34 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--base", required=True,
-                    help="Local path to OneRec-1.7B model dir "
-                         "(e.g. model/OneRec-1.7B).")
+                    help="Local path to base model dir (e.g. model/OneRec-1.7B). "
+                         "For DPO Stage 2 adapters, point this to the SFT merged "
+                         "output (runs/sft_only_50k/merged or model/OneRec-1.7B-sft50k/merged).")
 parser.add_argument("--adapter", required=True,
                     help="Path to LoRA adapter / training checkpoint dir.")
 parser.add_argument("--out", required=True,
                     help="Where to write the merged model.")
+parser.add_argument("--device", default=None,
+                    choices=["cuda", "cpu", "mps"],
+                    help="Device for the merge. Defaults to cuda if available, "
+                         "else cpu (mps is experimental and bf16 is unstable there).")
 args = parser.parse_args()
 
-print(f"Loading base from {args.base} ...")
+if args.device is None:
+    args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# bf16 throughout: matches training dtype on GPU and keeps disk footprint
+# small on CPU (~3.4 GB per 1.7B-param checkpoint). Torch 2.1+ supports
+# bf16 matmul on CPU; merging is mostly weight-add so even older builds work.
+print(f"Loading base from {args.base} on {args.device} (bf16) ...")
 base = AutoModelForCausalLM.from_pretrained(
     args.base,
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,
-    device_map={"": "cuda:0"},
+    device_map={"": args.device} if args.device == "cuda" else None,
 )
+if args.device != "cuda":
+    base = base.to(args.device)
 
 print(f"Attaching adapter from {args.adapter} ...")
 merged = PeftModel.from_pretrained(base, args.adapter).merge_and_unload()
